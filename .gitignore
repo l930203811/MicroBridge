@@ -1,0 +1,10 @@
+build/
+.vs/
+.idea/
+*.user
+*.log
+*.tmp
+.DS_Store
+desktop.ini
+ThirdParty/
+.workbuddy/
