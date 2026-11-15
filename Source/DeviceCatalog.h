@@ -34,6 +34,7 @@ namespace mb
         juce::String typeShortName; // 界面短驱动标签：WASAPI / WASAPI·Exclusive / ASIO ...
         bool isAsio = false;
         bool isMaster = false;
+        bool isLoopback = false;    // 虚拟设备：系统声音回环捕获（WASAPI loopback）
         bool available = true;      // 辅助设备打开失败时置 false
         juce::String error;
 
@@ -283,6 +284,20 @@ namespace mb
                 }
             }
 
+            // 虚拟设备固定排末尾（端口 id 依赖设备枚举顺序，见 rebuildPorts）：
+            // 系统声音回环捕获，输入专用 2 路（WASAPI loopback，见 LoopbackDevice.h）
+            {
+                DeviceEntry e;
+                e.typeIndex      = -1;                      // 无对应驱动类型
+                e.typeName       = S("System Loopback");    // 独立类型名，auxKey 天然隔离
+                e.inputName      = tr ("系统声音（回环）", "System Sound (Loopback)");
+                e.displayName    = e.inputName;
+                e.typeShortName  = S("WASAPI");
+                e.inputChannels  = 2;
+                e.isLoopback     = true;
+                devices_.push_back (e);
+            }
+
             reloadNotes();      // 备注必须先于端口显示标签计算
             rebuildPorts();
             reloadAuxPrefs();
@@ -347,6 +362,28 @@ namespace mb
             e.inputChannels  = p.inputChannels;   e.outputChannels  = p.outputChannels;
             e.inputChannelNames  = p.inputChannelNames;
             e.outputChannelNames = p.outputChannelNames;
+        }
+
+        /** 惰性探测指定驱动类型下非 ASIO 设备的真实通道数/名。
+            createDevice 只构造设备对象、不 open，不会抢占已打开的音频流；
+            结果经 probeCache_ 缓存，重复调用零开销。Setup 对话框打开 /
+            换驱动 / 手动「刷新」时调用，避免启动时全量初始化所有端点的开销。
+            返回是否有设备的通道数发生变化（变化即已重编端口）。 */
+        bool probeTypeChannels (juce::AudioDeviceManager& dm, const juce::String& typeName)
+        {
+            bool changed = false;
+            for (auto& d : devices_)
+            {
+                if (d.typeName != typeName || d.isAsio || d.typeIndex < 0) continue;
+                auto* type = typeFor (dm, d.typeIndex);
+                if (type == nullptr) continue;
+                const int inBefore  = d.inputChannels;
+                const int outBefore = d.outputChannels;
+                probeChannels (type, d);
+                changed |= d.inputChannels != inBefore || d.outputChannels != outBefore;
+            }
+            if (changed) rebuildPorts();
+            return changed;
         }
 
         void markMaster (const juce::String& typeName,

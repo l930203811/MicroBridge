@@ -57,10 +57,17 @@ namespace mb
         bool  limitOn     = false;
         float limitCeilDb = -1.0f;
 
+        bool  duckOn       = false;    // 侧链闪避：源通道出声时自动压低本通道
+        int   duckSrcCh    = -1;       // 源通道（-1 = 未指定；引擎忽略 == 自身）
+        float duckThreshDb = -28.0f;   // 源电平超过此值开始闪避
+        float duckDepthDb  = -12.0f;   // 压低量（0 ~ -24 dB）
+        float duckAtkMs    = 15.0f;    // 启动
+        float duckRelMs    = 350.0f;   // 释放
+
         bool any() const noexcept
         {
             return hpfOn || gateOn || compOn || reverbOn || limitOn
-                || driveOn || delayOn
+                || driveOn || delayOn || duckOn
                 || std::fabs (eqLowDb)  > 0.05f
                 || std::fabs (eqMidDb)  > 0.05f
                 || std::fabs (eqHighDb) > 0.05f;
@@ -90,8 +97,9 @@ namespace mb
         { 8, "激励驱动", "Drive"      },
         { 6, "限制器",   "Limiter"    },
         { 9, "播放器",   "Player"       },
+        { 10, "闪避",    "Ducker"     },
     };
-    inline constexpr int kBuiltInPluginCount = 9;
+    inline constexpr int kBuiltInPluginCount = 10;
 
     inline juce::String builtInPluginName (int id)
     {
@@ -124,6 +132,7 @@ namespace mb
             case 6: p.limitOn  = on; break;
             case 7: p.delayOn  = on; break;   // 时间/反馈/湿度取 FxParams 默认或用户上次值
             case 8: p.driveOn  = on; break;
+            case 10: p.duckOn = on; break;   // 源通道/深度等取 FxParams 当前值或默认
             default: break;
         }
     }
@@ -366,6 +375,18 @@ namespace mb
     public:
         static constexpr int kMaxChannels = 32;
 
+        /** 全通道参数快照（不可变）。侧链闪避等跨通道 DSP 在引擎层整体读取。 */
+        struct Published
+        {
+            std::array<FxParams, kMaxChannels> params {};
+        };
+
+        /** 音频线程：整体参数快照。 */
+        std::shared_ptr<const Published> snapshot() const
+        {
+            return pub_.load (std::memory_order_acquire);
+        }
+
         void prepare (double sampleRate, int maxBlock)
         {
             for (auto& s : slots_) s.prepare (sampleRate, maxBlock);
@@ -407,11 +428,6 @@ namespace mb
         }
 
     private:
-        struct Published
-        {
-            std::array<FxParams, kMaxChannels> params {};
-        };
-
         std::atomic<std::shared_ptr<const Published>> pub_;
         std::array<ChannelFxSlot, kMaxChannels> slots_;
         std::array<FxParams, kMaxChannels> uiParams_ {};

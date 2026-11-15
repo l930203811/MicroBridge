@@ -51,7 +51,7 @@ namespace mb
             root->setProperty ("saved", juce::Time::getCurrentTime().toISO8601 (true));
             root->setProperty ("channels", g.channelCount());
 
-            juce::Array<juce::var> faders, muted, solo, enabled, armed, names, colours, icons, slots, aligned, stereo;
+            juce::Array<juce::var> faders, pans, muted, solo, enabled, armed, names, colours, icons, slots, aligned, stereo;
             juce::Array<juce::var> linkAct, linkLetter, linkIdx, linkKey, linkMods;
             const auto& customNames = mb::customChannelNames();
             const auto& customCols  = mb::ui::customChannelColours();
@@ -59,9 +59,10 @@ namespace mb
             for (int c = 0; c < g.channelCount(); ++c)
             {
                 faders.add (g.fader (c));
+                pans.add (g.pan (c));
                 muted.add (g.isMuted (c));
                 solo.add (g.isSolo (c));
-                enabled.add (g.isEnabled (c));
+                enabled.add (g.storedEnabled (c));   // 独奏中保存快照值，不写扫过态
                 armed.add (mb::ui::isChannelArmed (c));
                 names.add (c < customNames.size() ? customNames[c] : juce::String());
                 colours.add (c < static_cast<int> (customCols.size())
@@ -70,14 +71,19 @@ namespace mb
                 slots.add (static_cast<int> (mb::ui::slotState (c)));
                 aligned.add (static_cast<int> (mb::ui::isChannelRightAligned (c)));
                 stereo.add (static_cast<int> (mb::ui::isChannelStereo (c)));
-                const auto lk = mb::links::linkOf (c);
-                linkAct.add (lk.action);
-                linkLetter.add (lk.letter);
-                linkIdx.add (lk.index);
-                linkKey.add (lk.key);
-                linkMods.add (lk.mods);
+                // 每通道 × 每动作一条配置，扁平存储：下标 = c * kActionCount + a
+                for (int a = 0; a < mb::links::kActionCount; ++a)
+                {
+                    const auto lk = mb::links::linkOf (c, a);
+                    linkAct.add (a);
+                    linkLetter.add (lk.letter);
+                    linkIdx.add (lk.index);
+                    linkKey.add (lk.key);
+                    linkMods.add (lk.mods);
+                }
             }
             root->setProperty ("faders", faders);
+            root->setProperty ("pans", pans);
             root->setProperty ("muted", muted);
             root->setProperty ("solo", solo);
             root->setProperty ("enabled", enabled);
@@ -207,11 +213,13 @@ namespace mb
             if (root == nullptr || root->getProperty ("app").toString() != "MicroBridge")
                 return false;
 
+            g.clearDroppedEdges();   // 新装载开始：清除上次装载/设备切换的掉边记录
             const int channels = juce::jlimit (1, 16,
                 static_cast<int> (root->getProperty ("channels")));
             g.resize (channels, inputPorts, outputPorts);
 
             const auto& faders  = root->getProperty ("faders");
+            const auto& pans    = root->getProperty ("pans");
             const auto& muted   = root->getProperty ("muted");
             const auto& solo    = root->getProperty ("solo");
             const auto& enabled = root->getProperty ("enabled");
@@ -227,6 +235,10 @@ namespace mb
                 const bool haveS = solo.isArray()   && c < solo.size();
                 g.setFader (c, haveF ? static_cast<float> (static_cast<double> (faders[c]))
                                      : 1.0f);
+                // 声像（旧预设无 pans 字段时保持居中 0）
+                if (pans.isArray() && c < pans.size())
+                    g.setPan (c, juce::jlimit (-1.0f, 1.0f,
+                              static_cast<float> (static_cast<double> (pans[c]))));
                 g.setMuted (c, haveM && (static_cast<bool> (muted[c])
                                           || static_cast<int> (muted[c]) != 0));
                 g.setSolo  (c, haveS && (static_cast<bool> (solo[c])
@@ -306,17 +318,43 @@ namespace mb
             const auto& linkKeyArr    = root->getProperty ("linkKey");
             const auto& linkModsArr   = root->getProperty ("linkMods");
             if (linkActArr.isArray() && linkLetterArr.isArray() && linkIdxArr.isArray())
-                for (int c = 0; c < channels && c < linkActArr.size()
-                                  && c < linkLetterArr.size() && c < linkIdxArr.size(); ++c)
+            {
+                const int actN = mb::links::kActionCount;
+                if (linkActArr.size() >= channels * actN)
                 {
-                    mb::links::LinkSpec s;
-                    s.action = juce::jlimit (0, mb::links::kActionCount - 1, static_cast<int> (linkActArr[c]));
-                    s.letter = juce::jlimit (0, mb::links::kLetterCount - 1, static_cast<int> (linkLetterArr[c]));
-                    s.index  = juce::jlimit (0, mb::links::kIndexCount,  static_cast<int> (linkIdxArr[c]));
-                    if (linkKeyArr.isArray()  && c < linkKeyArr.size())  s.key  = static_cast<int> (linkKeyArr[c]);
-                    if (linkModsArr.isArray() && c < linkModsArr.size()) s.mods = static_cast<int> (linkModsArr[c]);
-                    mb::links::setLink (c, s);
+                    // 新格式：每通道 × 每动作各一条（下标 = c * kActionCount + a）
+                    for (int c = 0; c < channels; ++c)
+                        for (int a = 0; a < actN; ++a)
+                        {
+                            const int i = c * actN + a;
+                            if (i >= linkActArr.size() || i >= linkLetterArr.size()
+                                || i >= linkIdxArr.size()) break;
+                            mb::links::LinkSpec s;
+                            s.letter = juce::jlimit (0, mb::links::kLetterCount - 1,
+                                                     static_cast<int> (linkLetterArr[i]));
+                            s.index  = juce::jlimit (0, mb::links::kIndexCount,
+                                                     static_cast<int> (linkIdxArr[i]));
+                            if (linkKeyArr.isArray()  && i < linkKeyArr.size())  s.key  = static_cast<int> (linkKeyArr[i]);
+                            if (linkModsArr.isArray() && i < linkModsArr.size()) s.mods = static_cast<int> (linkModsArr[i]);
+                            mb::links::setLink (c, a, s);
+                        }
                 }
+                else
+                {
+                    // 旧格式：每通道一条 → 迁移到其动作槽位，其余动作留空
+                    for (int c = 0; c < channels && c < linkActArr.size()
+                                      && c < linkLetterArr.size() && c < linkIdxArr.size(); ++c)
+                    {
+                        mb::links::LinkSpec s;
+                        s.action = juce::jlimit (0, mb::links::kActionCount - 1, static_cast<int> (linkActArr[c]));
+                        s.letter = juce::jlimit (0, mb::links::kLetterCount - 1, static_cast<int> (linkLetterArr[c]));
+                        s.index  = juce::jlimit (0, mb::links::kIndexCount,  static_cast<int> (linkIdxArr[c]));
+                        if (linkKeyArr.isArray()  && c < linkKeyArr.size())  s.key  = static_cast<int> (linkKeyArr[c]);
+                        if (linkModsArr.isArray() && c < linkModsArr.size()) s.mods = static_cast<int> (linkModsArr[c]);
+                        mb::links::setLink (c, s.action, s);
+                    }
+                }
+            }
 
             const auto& edges = root->getProperty ("edges");
             if (edges.isArray())
@@ -333,7 +371,23 @@ namespace mb
                     e.gain = static_cast<float> (static_cast<double> (o->getProperty ("g")));
                     e.side = o->hasProperty ("sd")
                                ? static_cast<int> (o->getProperty ("sd")) : -1; // 旧会话 = 双声道
-                    g.tryAddEdge (e, why);          // 非法边（越界/成环）静默丢弃
+                    // 非法边（成环/自环/负增益）静默丢弃；端口越界 = 设备不匹配，
+                    // 记入掉边表供 UI 提示 + NodeView 悬空角标（不再静默）。
+                    if (! g.tryAddEdge (e, why))
+                    {
+                        const bool badPort =
+                            (e.kind == mb::EdgeKind::InputToChannel
+                                 && e.src >= g.inputPortCount())
+                         || (e.kind == mb::EdgeKind::ChannelToOutput
+                                 && e.dst >= g.outputPortCount());
+                        if (badPort)
+                        {
+                            if (e.kind == mb::EdgeKind::InputToChannel)
+                                g.recordDroppedEdge ({ e.dst, e.src, 0 });
+                            else
+                                g.recordDroppedEdge ({ e.src, e.dst, 1 });
+                        }
+                    }
                 }
             }
 
@@ -550,6 +604,10 @@ namespace mb
             o->setProperty ("revOn", p.reverbOn);    o->setProperty ("revMix", p.reverbMix);
             o->setProperty ("revSize", p.reverbSize);
             o->setProperty ("limOn", p.limitOn);     o->setProperty ("limDb", p.limitCeilDb);
+            o->setProperty ("duckOn", p.duckOn);     o->setProperty ("duckSrc", p.duckSrcCh);
+            o->setProperty ("duckDb", p.duckThreshDb);
+            o->setProperty ("duckDepth", p.duckDepthDb);
+            o->setProperty ("duckAtk", p.duckAtkMs); o->setProperty ("duckRel", p.duckRelMs);
             return juce::var (o);
         }
 
@@ -584,6 +642,13 @@ namespace mb
             p.reverbOn = getB ("revOn", false); p.reverbMix = getF ("revMix", 0.22f);
             p.reverbSize = getF ("revSize", 0.5f);
             p.limitOn = getB ("limOn", false); p.limitCeilDb = getF ("limDb", -1.0f);
+            p.duckOn = getB ("duckOn", false);
+            p.duckSrcCh = o->getProperty ("duckSrc").isVoid()
+                        ? -1 : juce::jlimit (-1, 31, static_cast<int> (o->getProperty ("duckSrc")));
+            p.duckThreshDb = getF ("duckDb", -28.0f);
+            p.duckDepthDb = getF ("duckDepth", -12.0f);
+            p.duckAtkMs = getF ("duckAtk", 15.0f);
+            p.duckRelMs = getF ("duckRel", 350.0f);
             return p;
         }
     };

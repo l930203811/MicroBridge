@@ -31,7 +31,8 @@
 //   · 不提供右键菜单：点击通道 L/R 连接点 = 该点连接列表（逐条可移除）；
 //     通道卡片正文三区 = 「+输入 / +插件 / +输出」调用调音台对应浮层；
 //     双击通道卡片头部 = 重命名（与调音台共用名字表）；
-//   · 连线上随实时电平流动的光点 = channelPeak，20 Hz 由外部驱动 repaint。
+//   · 连线上随实时电平流动的光点：P→C 随设备输入端口进线电平，
+//     C→C / C→P 随源通道电平；20 Hz 由外部驱动 repaint。
 // 本组件只画不改布局：所有几何每次 paint 前由 computeLayout() 现算，
 // 鼠标命中使用同一份缓存，不存在与调音台不同步的独立状态。
 //==============================================================================
@@ -881,6 +882,8 @@ namespace mb
 
         void drawChannels (juce::Graphics& g)
         {
+            // 预设体验 5b：设备不匹配被丢弃路由涉及的通道 → 红色悬空角标
+            const auto dropped = graph_.droppedChannels();
             for (int c = 0; c < graph_.channelCount(); ++c)
             {
                 const auto slot = mb::ui::slotState (c);
@@ -925,7 +928,7 @@ namespace mb
 
                 // 通道链接角标：头部 M/S 左侧（如 A1）；制式徽标恒占右端，链接码左移
                 {
-                    const auto code = mb::links::codeString (mb::links::linkOf (c));
+                    const auto code = mb::links::codeString (mb::links::primaryOf (c));
                     if (code.isNotEmpty())
                     {
                         const float codeX = -76.0f;
@@ -949,6 +952,19 @@ namespace mb
                 }
 
                 drawBodyZones (g, c, alpha);               // 三区正文（左入 / 中插件 / 右出）
+
+                // 悬空角标：设备不匹配导致本通道部分路由未恢复（红色 ! ）
+                if (std::find (dropped.begin(), dropped.end(), c) != dropped.end())
+                {
+                    const auto badge = juce::Rectangle<float> (
+                        card.getRight() - 10.0f, card.getY() - 5.0f, 12.0f, 12.0f);
+                    g.setColour (mb::ui::meterRed);
+                    g.fillEllipse (badge);
+                    g.setFont (mb::ui::font (8.5f, true));
+                    g.setColour (juce::Colours::white);
+                    g.drawText (mb::S("!"), badge.toNearestInt(),
+                                juce::Justification::centred, false);
+                }
 
                 const auto ci = static_cast<size_t> (c);
                 if (mb::ui::isChannelStereo (c))
@@ -1053,10 +1069,13 @@ namespace mb
                                    juce::PathStrokeType::rounded));
                 if (d.arrow) drawArrow (g, colour, d.pts);
 
-                // 电平流动光点：无声时只剩微弱呼吸点，有声时随电平加亮加速
-                const int flowCh = d.edge.kind == mb::EdgeKind::InputToChannel
-                                     ? d.edge.dst : d.edge.src;
-                const float level = mb::ui::levelToMeter (engine_.channelPeak (flowCh));
+                // 电平流动光点：无声时只剩微弱呼吸点，有声时随电平加亮加速。
+                // P→C 边只随「设备输入端口」的真实进线电平点亮——通道内
+                // 播放器 / 互送等自发声源不会点亮设备进线；C→C / C→P 随源通道。
+                const float level = mb::ui::levelToMeter (
+                    d.edge.kind == mb::EdgeKind::InputToChannel
+                        ? engine_.inputPortPeak (d.edge.src)
+                        : engine_.channelPeak (d.edge.src));
                 const float t = juce::jlimit (0.0f, 1.0f, phase * (0.75f + 0.5f * level));
                 const auto pos = d.pts[static_cast<size_t> (
                     juce::roundToInt (t * static_cast<float> (d.pts.size() - 1)))];

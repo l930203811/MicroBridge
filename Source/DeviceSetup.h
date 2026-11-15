@@ -58,15 +58,18 @@ public:
             card_.addAndMakeVisible (l);
         };
 
-        makeLabel (typeLabel_,      mb::tr ("驱动类型  /  DRIVER",        "DRIVER TYPE"));
-        makeLabel (deviceLabel_,    mb::tr ("设备  /  DEVICE",             "DEVICE"));
-        makeLabel (rateLabel_,      mb::tr ("采样率  /  RATE",             "SAMPLE RATE"));
-        makeLabel (bufLabel_,       mb::tr ("缓冲  /  BUFFER",             "BUFFER"));
-        makeLabel (masterInLabel_,  mb::tr ("输入通道  /  INPUT CHANNELS",  "INPUT CHANNELS"));
-        makeLabel (masterOutLabel_, mb::tr ("输出通道  /  OUTPUT CHANNELS", "OUTPUT CHANNELS"));
-        makeLabel (auxLabel_,       mb::tr ("其他设备  /  OTHER DEVICES",   "OTHER DEVICES"));
-        makeLabel (auxInLabel_,     mb::tr ("输入设备  /  INPUT DEVICES",   "INPUT DEVICES"));
-        makeLabel (auxOutLabel_,    mb::tr ("输出设备  /  OUTPUT DEVICES",  "OUTPUT DEVICES"));
+        makeLabel (typeLabel_,      mb::tr ("驱动类型",        "DRIVER TYPE"));
+        makeLabel (deviceLabel_,    mb::tr ("设备",             "DEVICE"));
+        makeLabel (rateLabel_,      mb::tr ("采样率",             "SAMPLE RATE"));
+        makeLabel (bufLabel_,       mb::tr ("缓冲",              "BUFFER"));
+        makeLabel (masterInLabel_,  mb::tr ("输入通道",          "INPUT CHANNELS"));
+        makeLabel (masterOutLabel_, mb::tr ("输出通道",          "OUTPUT CHANNELS"));
+        makeLabel (auxLabel_,       mb::tr ("其他设备",          "OTHER DEVICES"));
+        makeLabel (auxInLabel_,     mb::tr ("输入设备",          "INPUT DEVICES"));
+        makeLabel (auxOutLabel_,    mb::tr ("输出设备",          "OUTPUT DEVICES"));
+        // 「其他设备」为分组大标题：字号与「默认音频设备」一致（17f 加粗同色）
+        auxLabel_.setFont (mb::ui::font (17.0f, true));
+        auxLabel_.setColour (juce::Label::textColourId, mb::ui::text);
 
         auto setupCombo = [this] (juce::ComboBox& c)
         {
@@ -116,7 +119,7 @@ public:
             if (ch)
                 showNoteEditor (key, nm,
                                 mb::tr ("通道备注", "Channel note"),
-                                mb::tr ("通道名  /  CHANNEL", "CHANNEL"));
+                                mb::tr ("通道名", "CHANNEL"));
             else
                 showNoteEditor (key, nm);
         };
@@ -137,16 +140,41 @@ public:
         cancelBtn_.setButtonText (mb::tr ("取消", "Cancel"));
         cancelBtn_.addListener (this);
         card_.addAndMakeVisible (cancelBtn_);   // 取消按钮始终显示（含首次/设备失效场景）
+        for (auto* b : { &okBtn_, &cancelBtn_ })
+        {
+            b->setColour (juce::TextButton::buttonColourId, mb::ui::sectionBg);
+            b->setColour (juce::TextButton::textColourOffId, mb::ui::text);
+        }
 
         error_.setFont (mb::ui::font (10.0f));
         error_.setColour (juce::Label::textColourId, mb::ui::meterRed);
         card_.addAndMakeVisible (error_);
 
+        // 左下角「刷新」：热刷新驱动与设备列表（重新枚举 + 惰性探测当前
+        // 驱动类型下非 ASIO 设备的真实通道），无需重启应用。
+        refreshBtn_.setButtonText (mb::tr ("刷新", "Refresh"));
+        refreshBtn_.setColour (juce::TextButton::buttonColourId, mb::ui::sectionBg);
+        refreshBtn_.setColour (juce::TextButton::textColourOffId, mb::ui::text);
+        refreshBtn_.onClick = [this]
+        {
+            engine_.rescanDevices (currentTypeName());
+            refreshTypeItems ();                          // 新插入的驱动进类型下拉
+            refreshDeviceList (selectedDeviceName());     // 设备下拉重建并保持选择
+            refreshLists ();
+        };
+        card_.addAndMakeVisible (refreshBtn_);
+
         loadChoices (initial);
+        engine_.rescanDevices (currentTypeName());   // 打开即惰性探测当前驱动的真实通道
         refreshLists();
         // 必须放在 loadChoices 之后：构造期 addItem 可能触发选择变化，
         // 提前挂 onChange 会把刚预选的驱动/设备重置掉。
-        typeBox_.onChange   = [this] { refreshDeviceList(); refreshLists(); };
+        typeBox_.onChange   = [this]
+        {
+            engine_.rescanDevices (currentTypeName());   // 换驱动：探测该类型真实通道
+            refreshDeviceList();
+            refreshLists();
+        };
         deviceBox_.onChange = [this] { refreshLists(); };
     }
 
@@ -160,21 +188,22 @@ public:
         subtitle_.setText (mb::tr ("选择驱动与设备，勾选需要的通道；确认后音频自动运行。",
                                    "Pick a driver and device, tick the channels you need; audio runs automatically."),
                            juce::dontSendNotification);
-        typeLabel_.setText      (mb::tr ("驱动类型  /  DRIVER",         "DRIVER TYPE"), juce::dontSendNotification);
-        deviceLabel_.setText    (mb::tr ("设备  /  DEVICE",              "DEVICE"), juce::dontSendNotification);
-        rateLabel_.setText      (mb::tr ("采样率  /  RATE",              "SAMPLE RATE"), juce::dontSendNotification);
-        bufLabel_.setText       (mb::tr ("缓冲  /  BUFFER",              "BUFFER"), juce::dontSendNotification);
-        masterInLabel_.setText  (mb::tr ("输入通道  /  INPUT CHANNELS",  "INPUT CHANNELS"), juce::dontSendNotification);
-        masterOutLabel_.setText (mb::tr ("输出通道  /  OUTPUT CHANNELS", "OUTPUT CHANNELS"), juce::dontSendNotification);
-        auxLabel_.setText       (mb::tr ("其他设备  /  OTHER DEVICES",   "OTHER DEVICES"), juce::dontSendNotification);
-        auxInLabel_.setText     (mb::tr ("输入设备  /  INPUT DEVICES",   "INPUT DEVICES"), juce::dontSendNotification);
-        auxOutLabel_.setText    (mb::tr ("输出设备  /  OUTPUT DEVICES",  "OUTPUT DEVICES"), juce::dontSendNotification);
+        typeLabel_.setText      (mb::tr ("驱动类型",         "DRIVER TYPE"), juce::dontSendNotification);
+        deviceLabel_.setText    (mb::tr ("设备",              "DEVICE"), juce::dontSendNotification);
+        rateLabel_.setText      (mb::tr ("采样率",              "SAMPLE RATE"), juce::dontSendNotification);
+        bufLabel_.setText       (mb::tr ("缓冲",              "BUFFER"), juce::dontSendNotification);
+        masterInLabel_.setText  (mb::tr ("输入通道",          "INPUT CHANNELS"), juce::dontSendNotification);
+        masterOutLabel_.setText (mb::tr ("输出通道",          "OUTPUT CHANNELS"), juce::dontSendNotification);
+        auxLabel_.setText       (mb::tr ("其他设备",          "OTHER DEVICES"), juce::dontSendNotification);
+        auxInLabel_.setText     (mb::tr ("输入设备",          "INPUT DEVICES"), juce::dontSendNotification);
+        auxOutLabel_.setText    (mb::tr ("输出设备",          "OUTPUT DEVICES"), juce::dontSendNotification);
         for (auto* b : { &masterInAllBtn_, &masterOutAllBtn_ })
             b->setButtonText (mb::tr ("全选", "All"));
         for (auto* b : { &masterInNoneBtn_, &masterOutNoneBtn_ })
             b->setButtonText (mb::tr ("清空", "None"));
         okBtn_.setButtonText (mb::tr ("确定", "Apply"));
         cancelBtn_.setButtonText (mb::tr ("取消", "Cancel"));
+        refreshBtn_.setButtonText (mb::tr ("刷新", "Refresh"));
         if (noteEditor_ != nullptr) noteEditor_->applyLanguage();
         repaint();
         // 分组标题上的「全选 / 清空」、行内「备注」按钮在 paint 里实时读当前语言。
@@ -196,6 +225,33 @@ public:
         okBtn_.setVisible (! p);
         cancelBtn_.setVisible (! p);
         resized();
+        repaint();
+    }
+
+    /** 主题切换后重刷本页控件配色（按钮 / 标签 / 下拉全部改读当前主题色）。 */
+    void refreshThemeColours()
+    {
+        for (auto* b : { &okBtn_, &cancelBtn_, &refreshBtn_,
+                         &masterInAllBtn_, &masterInNoneBtn_,
+                         &masterOutAllBtn_, &masterOutNoneBtn_ })
+        {
+            b->setColour (juce::TextButton::buttonColourId, mb::ui::sectionBg);
+            b->setColour (juce::TextButton::textColourOffId, mb::ui::text);
+        }
+        title_.setColour    (juce::Label::textColourId, mb::ui::text);
+        subtitle_.setColour (juce::Label::textColourId, mb::ui::subText);
+        auxLabel_.setColour (juce::Label::textColourId, mb::ui::text);
+        for (auto* l : { &typeLabel_, &deviceLabel_, &rateLabel_, &bufLabel_,
+                         &masterInLabel_, &masterOutLabel_,
+                         &auxInLabel_, &auxOutLabel_ })
+            l->setColour (juce::Label::textColourId, mb::ui::subText);
+        for (auto* c : { &typeBox_, &deviceBox_, &rateBox_, &bufferBox_ })
+        {
+            c->setColour (juce::ComboBox::backgroundColourId, mb::ui::card);
+            c->setColour (juce::ComboBox::textColourId,       mb::ui::text);
+            c->setColour (juce::ComboBox::outlineColourId,    mb::ui::border);
+            c->setColour (juce::ComboBox::arrowColourId,      mb::ui::subText);
+        }
         repaint();
     }
 
@@ -270,8 +326,8 @@ public:
         // 主设备通道区按内容自适应高度：多条通道时不需要下拉即可完整显示。
         const int contentH = juce::jmax (masterInList_.preferredHeight(),
                                          masterOutList_.preferredHeight()) + 4;
-        // 主区之前 168+20、间隔 8、其它设备区（区标题 20 + 两列标题 20 + 列表最小 120）、底部 70
-        const int reserveH = 426;
+        // 主区之前 168+20、间隔 8、其它设备区（区标题 20 + 两列标题 20 + 列表最小 120）、底部 44（按钮行上方留 4px）
+        const int reserveH = 400;
         const int masterH  = juce::jlimit (80, juce::jmax (80, maxH - reserveH), contentH);
         const int cardH    = plainMode_ ? getHeight()
                                         : juce::jmin (maxH, juce::jmax (470, reserveH + masterH));
@@ -312,12 +368,14 @@ public:
         // 其他设备区：左右两列（输入 / 输出）只显示列标题；
         // 「全选 / 清空」由每个驱动分组标题自带，列标题可占满整列宽度。
         const int auxY = masterY + 20 + masterH + 8;
-        auxLabel_.setBounds  (x1, auxY, fullW, 16);
-        const int colLabelY = auxY + 20;
+        auxLabel_.setBounds  (x1, auxY, fullW, 24);          // 17f 加粗大标题行高
+        const int colLabelY = auxY + 30;
         auxInLabel_.setBounds   (x1, colLabelY, colW, 16);
         auxOutLabel_.setBounds  (x2, colLabelY, colW, 16);
         const int auxListY = colLabelY + 20;
-        const int auxH = juce::jmax (80, cardH - auxListY - (plainMode_ ? 24 : 70));
+        // 底部预留裁剪到按钮行上方：内嵌模式 30（刷新按钮在页脚行 cardH-26），
+        // 弹窗模式 44（取消/确定按钮行顶 cardH-40，留 4px 间距），列表尽量占满。
+        const int auxH = juce::jmax (80, cardH - auxListY - (plainMode_ ? 30 : 44));
         auxInView_.setBounds   (x1, auxListY, colW, auxH);
         auxOutView_.setBounds  (x2, auxListY, colW, auxH);
 
@@ -326,7 +384,13 @@ public:
         auxInList_.setSize     (juce::jmax (10, colW - 14),  auxInList_.preferredHeight());
         auxOutList_.setSize    (juce::jmax (10, colW - 14),  auxOutList_.preferredHeight());
 
-        error_.setBounds       (24, cardH - 60, cardW - 48, 18);
+        // 内嵌模式：「刷新」放进底部按钮行，与设置页页脚「应用/关闭」同行同高
+        // （26px，左下角），不再额外占用其他设备列表空间；弹窗模式与「取消/确定」
+        // 同行同高（30px）。
+        refreshBtn_.setBounds  (24, plainMode_ ? cardH - 26 : cardH - 40,
+                                90, plainMode_ ? 26 : 30);
+        error_.setBounds       (plainMode_ ? 126 : 24, plainMode_ ? cardH - 22 : cardH - 60,
+                                plainMode_ ? cardW - 150 : cardW - 48, 18);
         okBtn_.setBounds       (cardW - 24 - 116, cardH - 40, 116, 30);
         cancelBtn_.setBounds   (cardW - 24 - 116 - 8 - 90, cardH - 40, 90, 30);
         positionNoteEditor();
@@ -420,9 +484,9 @@ private:
             const int split = splitX();
             g.setFont (mb::ui::font (9.0f));
             g.setColour (mb::ui::subText);
-            g.drawText (mb::tr ("备注名  /  NOTE", "NOTE"), 16, 36, split - 32, 16,
+            g.drawText (mb::tr ("备注名", "NOTE"), 16, 36, split - 32, 16,
                         juce::Justification::centredLeft, false);
-            g.drawText (rightText_.isEmpty() ? mb::tr ("设备名  /  DEVICE", "DEVICE") : rightText_,
+            g.drawText (rightText_.isEmpty() ? mb::tr ("设备名", "DEVICE") : rightText_,
                         split + 8, 36,
                         getWidth() - split - 24, 16, juce::Justification::centredRight, false);
 
@@ -999,7 +1063,8 @@ private:
                 // 通道对备注：键 = 设备备注键|@对基址|in|out，与设备备注同表。
                 it.note         = engine_.catalog().channelNote (src, input, c);
                 it.noteKey      = mb::DeviceCatalog::channelNoteKey (src, input, c);
-                it.deviceName   = pairLabel (names, c, total);
+                it.deviceName   = devName + mb::S(" · ") + pairLabel (names, c, total);
+                // 行内直接显示设备名 · 通道对（长名 drawFittedText 缩放，tooltip 兜底）
                 it.noteEditable = true;
                 it.showIoTag    = false;   // 两列本身就是方向，行首不再重复 IN/OUT
                 it.channelNoteRow = true;
@@ -1342,6 +1407,7 @@ private:
     bool plainMode_ = false;   // 设置页内嵌模式：无遮罩、卡片铺满
     juce::Label title_, subtitle_, typeLabel_, deviceLabel_, rateLabel_, bufLabel_,
                 masterInLabel_, masterOutLabel_, auxLabel_, auxInLabel_, auxOutLabel_, error_;
+    juce::TextButton refreshBtn_;
     juce::ComboBox typeBox_, deviceBox_, rateBox_, bufferBox_;
     juce::TextButton masterInAllBtn_, masterInNoneBtn_, masterOutAllBtn_, masterOutNoneBtn_;
     juce::StringArray typeRawNames_;                // 下拉 itemId 1..N 对应的真实驱动类型名

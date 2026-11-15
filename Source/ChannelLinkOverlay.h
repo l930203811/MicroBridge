@@ -10,9 +10,12 @@
 //==============================================================================
 // 「快捷键与链接」弹窗：动作 × 类型字母 × 序号 三行网格选择（链接），
 // 外加快捷键录入按钮（可选；不录入 = 只链接不触发快捷键）。
+// 每个动作（开关/音量/效果/显示/独奏）各有一条独立配置：点动作行切换编辑
+// 对象，字母/序号/快捷键都随动作分开保存 —— 开关可绑 A1+Ctrl+F1，效果同时
+// 绑 B2+Alt+E，互不影响。
 // 顶部显示当前通道名称；同码（同步组）/ 同字母不同码（互斥组）的通道
 // 分别列出，方便识别通道之间的联动关系。
-// 分组名单与快捷键继承均为实时计算：弹窗内切换字母/序号立即重算，
+// 分组名单与快捷键继承均为实时计算：弹窗内切换动作/字母/序号立即重算，
 // 通道名等其他通道数据通过 linkFor 回调实时读取，不使用打开时的快照。
 // 录入的快捷键由宿主注册为系统级全局热键（本应用不在前台也生效）；
 // 录入期间通过 onHotkeyCapture 让宿主临时抑制钩子，避免吞键 / 误触发。
@@ -20,16 +23,16 @@
 class ChannelLinkOverlay : public juce::Component
 {
 public:
-    std::function<void (int ch, mb::links::LinkSpec)> onApply;
+    std::function<void (int ch, const mb::links::LinkSet&)> onApply;
     std::function<void()> onCancel;
-    // 实时数据源（构造后由宿主接线）：通道总数 / 读取任意通道当前链接
+    // 实时数据源（构造后由宿主接线）：通道总数 / 读取任意通道某动作当前链接
     std::function<int()> channelCount;
-    std::function<mb::links::LinkSpec (int)> linkFor;
+    std::function<mb::links::LinkSpec (int, int)> linkFor;
     // 录入模式开关（宿主据此临时抑制系统级钩子，防止吞掉正在录入的按键）
     std::function<void (bool)> onHotkeyCapture;
 
-    ChannelLinkOverlay (int ch, mb::links::LinkSpec current)
-        : channel_ (ch), spec_ (current)
+    ChannelLinkOverlay (int ch, const mb::links::LinkSet& current, int initialAction)
+        : channel_ (ch), specs_ (current)
     {
         setOpaque (true);
         setWantsKeyboardFocus (true);
@@ -55,9 +58,9 @@ public:
         card_.addAndMakeVisible (mutexLabel_);
 
         // 大号链接码 + 状态提示
-        codeLabel_.setText (mb::links::codeString (spec_).isEmpty()
+        codeLabel_.setText (mb::links::codeString (spec()).isEmpty()
                                 ? mb::S("—")
-                                : mb::links::codeString (spec_),
+                                : mb::links::codeString (spec()),
                             juce::dontSendNotification);
         codeLabel_.setFont (mb::ui::font (32.0f, true));
         codeLabel_.setColour (juce::Label::textColourId, mb::ui::accent[0]);
@@ -75,7 +78,10 @@ public:
         descLabel_.setJustificationType (juce::Justification::centred);
         card_.addAndMakeVisible (descLabel_);
 
-        // 三行分段按钮
+        // 全动作配置摘要：每个动作各自的链接码与快捷键一览
+        card_.addAndMakeVisible (summary_);
+
+        // 三行分段按钮：动作行 = 切换编辑对象（各动作独立配置）
         auto styleSeg = [this] (juce::TextButton& b, int row, int col)
         {
             b.onClick = [this, row, col] { pick (row, col); };
@@ -105,13 +111,15 @@ public:
             b.onClick = std::move (fn);
             card_.addAndMakeVisible (b);
         };
-        styleBottom (okBtn_,    [this] { if (onApply) onApply (channel_, spec_); });
+        styleBottom (okBtn_,    [this] { if (onApply) onApply (channel_, specs_); });
         styleBottom (cancelBtn_, [this] { if (onCancel) onCancel(); });
         styleBottom (clearBtn_,  [this]
         {
-            spec_.index = 0;
-            if (onApply) onApply (channel_, spec_);   // 清空即解除绑定
+            spec().index = 0;                        // 清空当前动作的链接绑定
+            if (onApply) onApply (channel_, specs_);
         });
+
+        editing_ = juce::jlimit (0, mb::links::kActionCount - 1, initialAction);
 
         addAndMakeVisible (card_);
         refreshLook();
@@ -125,7 +133,7 @@ public:
     void resized() override
     {
         const int cardW = juce::jlimit (380, 460, getWidth() - 60);
-        const int cardH = 412;
+        const int cardH = 444;
         card_.setBounds ((getWidth() - cardW) / 2, (getHeight() - cardH) / 2, cardW, cardH);
 
         title_.setBounds        (20, 14, cardW - 40, 26);
@@ -147,6 +155,8 @@ public:
 
         hotkeyBtn_.setBounds (20, 316, cardW - 40, 30);
 
+        summary_.setBounds   (20, 352, cardW - 40, 34);
+
         okBtn_.setBounds    (cardW / 2 - 170, cardH - 52, 100, 30);
         cancelBtn_.setBounds (cardW / 2 - 60,  cardH - 52, 100, 30);
         clearBtn_.setBounds (cardW / 2 + 50,  cardH - 52, 110, 30);
@@ -166,25 +176,31 @@ public:
         if (key.getKeyCode() == juce::KeyPress::deleteKey
             || key.getKeyCode() == juce::KeyPress::backspaceKey)   // Del/退格 = 清除
         {
-            spec_.key = 0;
-            spec_.mods = 0;
+            spec().key = 0;
+            spec().mods = 0;
             setCapturing (false);
             hotkeyInherited_ = false;
             refreshHotkeyDisplay();
             refreshHint();
+            refreshSummary();
             return true;
         }
 
-        spec_.key  = key.getKeyCode();
-        spec_.mods = key.getModifiers().getRawFlags();
+        spec().key  = key.getKeyCode();
+        spec().mods = key.getModifiers().getRawFlags();
         setCapturing (false);
         hotkeyInherited_ = false;                    // 用户自设快捷键，不再是继承态
         refreshHotkeyDisplay();
         refreshHint();
+        refreshSummary();
         return true;
     }
 
 private:
+    /** 当前正在编辑的动作配置（动作行切换编辑对象）。 */
+    mb::links::LinkSpec&       spec()       noexcept { return specs_.per[editing_]; }
+    const mb::links::LinkSpec& spec() const noexcept { return specs_.per[editing_]; }
+
     class Card : public juce::Component
     {
     public:
@@ -219,38 +235,50 @@ private:
         juce::AttributedString text_;
     };
 
-    /** 行/列选择：动作行直接改 action；字母行改 letter；序号行改 index。 */
+    /** 行/列选择：动作行 = 切换编辑对象（各动作独立配置）；
+        字母行 / 序号行只改当前动作的链接码。 */
     void pick (int row, int col)
     {
-        // 继承自原同码组的快捷键随换码失效：先清除，再由 refreshGroups
-        // 按新组重新继承（组内有人设键才继承）；用户自设键保留不受影响
-        if (hotkeyInherited_)
+        if (row == 0)
         {
-            spec_.key = 0;
-            spec_.mods = 0;
+            if (editing_ == col) return;
+            editing_ = col;              // 换编辑对象：继承态作废，由 refreshGroups 重算
             hotkeyInherited_ = false;
-            refreshHotkeyDisplay();
+            setCapturing (false);        // 录入中切动作：取消录入态，避免键落入新动作
+            refreshHotkeyDisplay();      // 录入按钮立即切到新动作自己的快捷键 / 待录入状态
         }
-        if (row == 0)      spec_.action = col;
-        else if (row == 1) spec_.letter = col;
-        else               spec_.index  = col + 1;
+        else
+        {
+            // 继承自原同码组的快捷键随换码失效：先清除，再由 refreshGroups
+            // 按新组重新继承（组内有人设键才继承）；用户自设键保留不受影响
+            if (hotkeyInherited_)
+            {
+                spec().key = 0;
+                spec().mods = 0;
+                hotkeyInherited_ = false;
+                refreshHotkeyDisplay();
+            }
+            if (row == 1) spec().letter = col;
+            else          spec().index  = col + 1;
+        }
         refreshLook();
         refreshHint();
-        refreshGroups();     // 切换链接码即时重算 同码/互斥 分组与快捷键继承
+        refreshSummary();
+        refreshGroups();     // 切换动作/链接码即时重算 同码/互斥 分组与快捷键继承
     }
 
     void refreshLook()
     {
         for (int a = 0; a < mb::links::kActionCount; ++a)
-            styleSegment (actionBtns_[a], spec_.action == a, mb::links::actionName (a));
+            styleSegment (actionBtns_[a], editing_ == a, mb::links::actionName (a));
         for (int l = 0; l < mb::links::kLetterCount; ++l)
-            styleSegment (letterBtns_[l], spec_.letter == l, mb::links::letterName (l));
+            styleSegment (letterBtns_[l], spec().letter == l, mb::links::letterName (l));
         for (int i = 0; i < mb::links::kIndexCount; ++i)
-            styleSegment (indexBtns_[i], spec_.index == i + 1, juce::String (i + 1));
+            styleSegment (indexBtns_[i], spec().index == i + 1, juce::String (i + 1));
 
-        codeLabel_.setText (spec_.bound() ? mb::links::codeString (spec_) : mb::S("—"),
+        codeLabel_.setText (spec().bound() ? mb::links::codeString (spec()) : mb::S("—"),
                             juce::dontSendNotification);
-        descLabel_.setText (mb::links::actionDesc (spec_.action), juce::dontSendNotification);
+        descLabel_.setText (mb::links::actionDesc (editing_), juce::dontSendNotification);
     }
 
     void styleSegment (juce::TextButton& b, bool selected, const juce::String& text)
@@ -279,8 +307,8 @@ private:
         hotkeyBtn_.setButtonText (capturing_
             ? mb::tr ("请按下快捷键…（系统级全局，Esc 取消 / Del 清除）",
                       "Press keys… (system-wide; Esc cancel / Del clear)")
-            : (mb::links::hotkeyText (spec_).isNotEmpty()
-                   ? mb::tr ("快捷键（全局）  ", "Hotkey (global):  ") + mb::links::hotkeyText (spec_)
+            : (mb::links::hotkeyText (spec()).isNotEmpty()
+                   ? mb::tr ("快捷键（当前动作）  ", "Hotkey (current action):  ") + mb::links::hotkeyText (spec())
                          + (hotkeyInherited_ ? mb::tr ("（同码共享，修改后全组同步）",
                                                        " (shared by code — edits sync to group)")
                                              : juce::String())
@@ -288,26 +316,54 @@ private:
                              "No hotkey — click to record (global, link only)")));
     }
 
+    /** 全动作配置摘要：一眼看清每个动作各绑了什么码与键。 */
+    void refreshSummary()
+    {
+        juce::AttributedString s;
+        bool any = false;
+        for (int a = 0; a < mb::links::kActionCount; ++a)
+        {
+            const auto& sp = specs_.per[a];
+            if (! sp.bound() && ! sp.hasHotkey()) continue;
+            any = true;
+            if (s.getNumAttributes() > 0)
+                s.append (mb::S ("  ·  "), mb::ui::font (10.5f), mb::ui::subText);
+            s.append (mb::links::actionName (a) + mb::S (" "),
+                      mb::ui::font (10.5f, true), mb::ui::text);
+            if (sp.bound())
+                s.append (mb::links::codeString (sp) + mb::S (" "),
+                          mb::ui::font (10.5f, true), mb::ui::accent[0]);
+            if (sp.hasHotkey())
+                s.append (mb::links::hotkeyText (sp),
+                          mb::ui::font (10.5f), mb::ui::accent[0]);
+        }
+        if (! any)
+            s.append (mb::tr ("各动作独立配置：点上方动作行切换，链接码与快捷键分开设置",
+                              "Per-action config: pick an action above; code & hotkey saved separately"),
+                      mb::ui::font (10.5f), mb::ui::subText);
+        s.setJustification (juce::Justification::centred);
+        summary_.set (std::move (s));
+    }
+
     void refreshHint()
     {
-        // 快捷键冲突检测（实时）：其他通道已用相同按键且不属于同码共享组。
+        // 快捷键冲突检测（实时）：其他通道同动作已用相同按键且不属于同码共享组。
         // 同字母不同码（互斥组）内冲突最危险 —— 按下会互相顶掉 / 同时翻转，
         // 与无关通道冲突则会一起被触发，两种都要明确提示用户。
-        if (spec_.hasHotkey() && channelCount && linkFor)
+        if (spec().hasHotkey() && channelCount && linkFor)
         {
             juce::StringArray mutexOthers, others;
             for (int c = 0; c < channelCount(); ++c)
             {
                 if (c == channel_) continue;
-                const auto l = linkFor (c);
-                if (! l.hasHotkey() || l.key != spec_.key || l.mods != spec_.mods)
+                const auto l = linkFor (c, editing_);
+                if (! l.hasHotkey() || l.key != spec().key || l.mods != spec().mods)
                     continue;
-                if (l.bound() && l.action == spec_.action
-                    && l.letter == spec_.letter && l.index == spec_.index)
+                if (l.bound() && l.letter == spec().letter && l.index == spec().index)
                     continue;                        // 同码组共享快捷键 = 正常，不算冲突
                 const auto n = mb::S ("CH") + juce::String (c + 1)
                              + mb::S (" ") + mb::channelDisplayName (c);
-                if (l.bound() && l.action == spec_.action && l.letter == spec_.letter)
+                if (l.bound() && l.letter == spec().letter)
                     mutexOthers.add (n);             // 同字母不同码 = 互斥组内冲突
                 else
                     others.add (n);                  // 无关通道冲突
@@ -332,14 +388,14 @@ private:
         }
 
         hintLabel_.setColour (juce::Label::textColourId, mb::ui::subText);
-        if (! spec_.bound())
+        if (! spec().bound())
         {
             hintLabel_.setText (mb::tr ("未选择序号 = 仅保存动作与类型，暂不参与联动",
                                         "Pick an index to enable linking"),
                                 juce::dontSendNotification);
             return;
         }
-        hintLabel_.setText (spec_.hasHotkey()
+        hintLabel_.setText (spec().hasHotkey()
                                 ? mb::tr ("按快捷键可整组翻转开关状态",
                                           "Hotkey toggles the whole group")
                                 : mb::tr ("同码同步 · 同字母互斥 · 无快捷键",
@@ -355,16 +411,16 @@ private:
     {
         juce::Array<int> syncCh, mutexCh;
         juce::StringArray mutexCodes;
-        const bool ready = spec_.bound() && channelCount && linkFor;
+        const bool ready = spec().bound() && channelCount && linkFor;
 
         if (ready)
             for (int c = 0; c < channelCount(); ++c)
             {
                 if (c == channel_) continue;
-                const auto l = linkFor (c);
-                if (! l.bound() || l.action != spec_.action || l.letter != spec_.letter)
+                const auto l = linkFor (c, editing_);
+                if (! l.bound() || l.letter != spec().letter)
                     continue;
-                if (l.index == spec_.index)
+                if (l.index == spec().index)
                     syncCh.add (c);                                   // 同字母同码：同步组
                 else
                 {
@@ -376,7 +432,7 @@ private:
         // —— 同码同步组（前缀高亮，通道名按通道色）——
         {
             juce::AttributedString s;
-            if (! spec_.bound())
+            if (! spec().bound())
                 s.append (mb::tr ("同码同步组：—（先选择序号绑定链接码）",
                                   "Sync group (same code): — (pick an index first)"),
                           mb::ui::font (12.0f), mb::ui::text);
@@ -404,7 +460,7 @@ private:
         // —— 同字母互斥组（前缀高亮，通道名+码按通道色）——
         {
             juce::AttributedString s;
-            if (! spec_.bound())
+            if (! spec().bound())
                 s.append (mb::tr ("同字母互斥组：—（先选择序号绑定链接码）",
                                   "Mutex group (same letter): — (pick an index first)"),
                           mb::ui::font (12.0f), mb::ui::text);
@@ -430,36 +486,36 @@ private:
             mutexLabel_.set (std::move (s));
         }
 
-        // 同码组快捷键实时继承：本通道未设快捷键 → 取组内已有快捷键作默认
-        if (ready && ! spec_.hasHotkey())
+        // 同码组快捷键实时继承（仅当前动作）：本通道未设快捷键 → 取组内已有快捷键作默认
+        if (ready && ! spec().hasHotkey())
             for (int c = 0; c < channelCount(); ++c)
             {
                 if (c == channel_) continue;
-                const auto l = linkFor (c);
+                const auto l = linkFor (c, editing_);
                 if (l.bound() && l.hasHotkey()
-                    && l.action == spec_.action && l.letter == spec_.letter
-                    && l.index == spec_.index)
+                    && l.letter == spec().letter && l.index == spec().index)
                 {
-                    spec_.key = l.key;
-                    spec_.mods = l.mods;
+                    spec().key = l.key;
+                    spec().mods = l.mods;
                     hotkeyInherited_ = true;
                     refreshHotkeyDisplay();
                     break;
                 }
             }
-        if (! spec_.bound())
+        if (! spec().bound())
             hotkeyInherited_ = false;
 
         refreshHint();       // 继承/换码后快捷键可能新产生冲突，同步刷新警示
     }
 
     int channel_;
-    mb::links::LinkSpec spec_;
+    mb::links::LinkSet specs_;                   // 每个动作一条独立配置
+    int  editing_ = 0;                           // 当前编辑的动作（动作行选择）
     bool capturing_ = false;
     bool hotkeyInherited_ = false;               // 快捷键来自同码组默认（修改后全组同步）
     Card card_;
     juce::Label title_, name_, codeLabel_, hintLabel_, descLabel_;
-    GroupLine sameCodeLabel_, mutexLabel_;       // 分组提示：前缀高亮 + 通道名按通道色
+    GroupLine sameCodeLabel_, mutexLabel_, summary_;
     juce::TextButton hotkeyBtn_;
     juce::TextButton actionBtns_[mb::links::kActionCount];
     juce::TextButton letterBtns_[mb::links::kLetterCount];

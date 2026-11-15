@@ -735,6 +735,9 @@ public:
 
         graph_.resize (6, engine_.catalog().inputPortCount(),
                           engine_.catalog().outputPortCount());
+        // 独奏豁免：「向右对齐」的监听/输出总线通道不参与独奏剪枝——
+        // 独奏任何通道都不应把输出到耳机的总线整条静默。
+        graph_.soloExempt = [] (int ch) { return mb::ui::isChannelRightAligned (ch); };
         engine_.prepareBuffers();
 
         viewport_.setViewedComponent (&stripContainer_, false);
@@ -846,6 +849,7 @@ public:
             for (auto& s : strips_) s->syncFromGraph();
             updateSummary();
             setMessage (mb::tr ("已恢复上次会话", "Session restored"));
+            reportDroppedRoutes (mb::tr ("已恢复上次会话", "Session restored"));
         }
         engine_.syncDevices();
 
@@ -1452,6 +1456,16 @@ private:
             graph_.setPortCounts (inputs, outputs);
         }
 
+        // 预设体验 5a：语义通道名只随这套默认配线显式写入。channelName 本身
+        // 只给 CH 编号，用户自建空白预设不会看到「系统/伴奏/麦克风」语义名。
+        {
+            auto& names = mb::customChannelNames();
+            const int n = juce::jmin (9, graph_.channelCount());
+            while (names.size() < n) names.add (juce::String());
+            for (int c = 0; c < n; ++c)
+                names.set (c, mb::defaultLiveChannelName (c));
+        }
+
         const auto inPairs  = collectPortPairs (true);
         const auto outPairs = collectPortPairs (false);
         std::vector<bool> usedIn (inPairs.size(), false), usedOut (outPairs.size(), false);
@@ -1895,9 +1909,9 @@ private:
             fx.push_back (engine_.fxParams (order[static_cast<size_t> (i)]));
 
         // 通道链接码跟随通道实体移动；重排/装载期间抑制 FX 联动钩子
-        std::vector<mb::links::LinkSpec> links (static_cast<size_t> (n));
+        std::vector<mb::links::LinkSet> links (static_cast<size_t> (n));
         for (int i = 0; i < n; ++i)
-            links[static_cast<size_t> (i)] = mb::links::linkOf (order[static_cast<size_t> (i)]);
+            links[static_cast<size_t> (i)] = mb::links::linkSetOf (order[static_cast<size_t> (i)]);
 
         {
             juce::ScopedValueSetter<bool> guard (linkSyncing_, true);
@@ -2069,7 +2083,7 @@ private:
         icons.set (dst, mb::channelIcon (src));
 
         engine_.setFxParams (dst, engine_.fxParams (src));
-        mb::links::setLink (dst, mb::links::linkOf (src));   // 复制链接绑定
+        mb::links::setLinkSet (dst, mb::links::linkSetOf (src));   // 复制链接绑定（全部动作）
         engine_.mediaPlayers().copyConfig (src, dst);        // 复制播放列表与设置
 
         auto& bank = engine_.pluginBank();
@@ -2225,8 +2239,8 @@ private:
             : mb::tr ("已显示通道", "Channel shown"));
 
         // 插槽链接：手动隐藏 / 显示也同步同码通道并触发同字母互斥
-        const auto l = mb::links::linkOf (ch);
-        if (l.bound() && l.action == mb::links::kSlot && ! linkSyncing_)
+        const auto l = mb::links::linkOf (ch, mb::links::kSlot);
+        if (l.bound() && ! linkSyncing_)
             applyLinkState (ch, mb::links::kSlot, ! hidden);
     }
 
@@ -2755,7 +2769,7 @@ private:
     void applyLinkState (int srcCh, int action, bool on)
     {
         if (linkSyncing_) return;
-        const auto src = mb::links::linkOf (srcCh);
+        const auto src = mb::links::linkOf (srcCh, action);
 
         // 未绑定链接码的通道：直接写本通道状态（按钮点击的普通路径）
         if (! src.bound())
@@ -2773,8 +2787,8 @@ private:
         // 1) 同码同步组 → 全组置为 on
         for (int c = 0; c < n; ++c)
         {
-            const auto l = mb::links::linkOf (c);
-            if (! l.bound() || l.action != action) continue;
+            const auto l = mb::links::linkOf (c, action);
+            if (! l.bound()) continue;
             if (l.letter == src.letter && l.index == src.index)
                 changed |= setLinkChannelState (c, action, on);
         }
@@ -2784,8 +2798,8 @@ private:
         {
             for (int c = 0; c < n; ++c)
             {
-                const auto l = mb::links::linkOf (c);
-                if (! l.bound() || l.action != action) continue;
+                const auto l = mb::links::linkOf (c, action);
+                if (! l.bound()) continue;
                 if (l.letter == src.letter && l.index != src.index)
                     changed |= setLinkChannelState (c, action, false);
             }
@@ -2809,16 +2823,16 @@ private:
     /** 音量链接：拖动推子时，同码通道的推子等值跟随（无互斥语义）。 */
     void applyLinkVolume (int srcCh, float gain)
     {
-        const auto src = mb::links::linkOf (srcCh);
-        if (! src.bound() || src.action != mb::links::kVolume || linkSyncing_) return;
+        const auto src = mb::links::linkOf (srcCh, mb::links::kVolume);
+        if (! src.bound() || linkSyncing_) return;
         juce::ScopedValueSetter<bool> guard (linkSyncing_, true);
 
         bool changed = false;
         for (int c = 0; c < graph_.channelCount(); ++c)
         {
             if (c == srcCh) continue;
-            const auto l = mb::links::linkOf (c);
-            if (! l.bound() || l.action != mb::links::kVolume) continue;
+            const auto l = mb::links::linkOf (c, mb::links::kVolume);
+            if (! l.bound()) continue;
             if (l.letter != src.letter || l.index != src.index) continue;
             if (std::abs (graph_.fader (c) - gain) < 1.0e-4f) continue;
             graph_.setFader (c, gain);
@@ -2845,8 +2859,8 @@ private:
             bool anyOn = false;
             for (int c = 0; c < n; ++c)
             {
-                const auto l = mb::links::linkOf (c);
-                if (! l.hasHotkey() || l.action != action) continue;
+                const auto l = mb::links::linkOf (c, action);
+                if (! l.hasHotkey()) continue;
                 if (! mb::links::matchesHotkey (l, key)) continue;
                 members.push_back (c);
                 if (linkChannelState (c, action)) anyOn = true;
@@ -2857,10 +2871,10 @@ private:
             // 同码去重：同一链接码只触发一次整组翻转
             for (size_t i = 0; i < members.size(); ++i)
             {
-                const auto code = mb::links::linkOf (members[i]);
+                const auto code = mb::links::linkOf (members[i], action);
                 bool first = true;
                 for (size_t j = 0; j < i && first; ++j)
-                    first = mb::links::linkOf (members[j]) != code;
+                    first = mb::links::linkOf (members[j], action) != code;
                 if (first) applyLinkState (members[i], action, ! anyOn);
             }
         }
@@ -2872,107 +2886,125 @@ private:
     {
         if (linkSyncing_) return;
         if (static_cast<int> (strips_.size()) != graph_.channelCount()) return;  // 装载中
-        const auto l = mb::links::linkOf (ch);
-        if (! l.bound() || l.action != mb::links::kFx) return;
+        const auto l = mb::links::linkOf (ch, mb::links::kFx);
+        if (! l.bound()) return;
         applyLinkState (ch, mb::links::kFx, linkChannelState (ch, mb::links::kFx));
     }
 
     /** 打开「快捷键与链接」弹窗。defaultAction：通道尚未绑定任何链接/快捷键时
         预选的动作（如插件菜单入口传 kFx）；-1 = 用系统默认「开关」。
-        通道已有配置时不覆盖 —— 弹窗必须如实反映当前绑定，避免确定时误改。
+        每个动作各有一条独立配置（链接码与快捷键随动作分开保存），弹窗内
+        点动作行切换编辑对象。
         弹窗内列出 同码同步组 / 同字母互斥组 通道；同码组的快捷键全组共享。 */
     void showChannelLinkDialog (int ch, int defaultAction = -1)
     {
         closeLinkOverlay();
-        auto cur = mb::links::linkOf (ch);
-        if (defaultAction >= 0 && ! cur.bound() && ! cur.hasHotkey())
-            cur.action = defaultAction;
+        auto cur = mb::links::linkSetOf (ch);
+        int initialAction = 0;
+        if (defaultAction >= 0 && ! mb::links::anyBound (ch))
+            initialAction = defaultAction;                 // 全未配置：按入口意图预选动作
+        else
+            for (int a = 0; a < mb::links::kActionCount; ++a)
+                if (cur[a].bound() || cur[a].hasHotkey()) { initialAction = a; break; }
 
         // 同码/互斥分组名单与快捷键继承全部在弹窗内实时计算
         // （linkFor 每次读取各通道当前链接，弹窗内换码立即刷新，不用打开时快照）
-        linkOverlay_ = std::make_unique<ChannelLinkOverlay> (ch, cur);
+        linkOverlay_ = std::make_unique<ChannelLinkOverlay> (ch, cur, initialAction);
         linkOverlay_->channelCount = [this] { return graph_.channelCount(); };
-        linkOverlay_->linkFor      = [] (int c) { return mb::links::linkOf (c); };
+        linkOverlay_->linkFor      = [] (int c, int a) { return mb::links::linkOf (c, a); };
         // 录入通道快捷键期间放行按键，否则系统级钩子会吞掉 / 误触发正在录的组合键
         linkOverlay_->onHotkeyCapture = [this] (bool capturing)
         {
             hotkeyEngine_.setSuppressed (capturing);
         };
-        linkOverlay_->onApply = [this] (int ch2, mb::links::LinkSpec s)
+        linkOverlay_->onApply = [this] (int ch2, const mb::links::LinkSet& set)
         {
-            mb::links::setLink (ch2, s);
+            for (int a = 0; a < mb::links::kActionCount; ++a)
+                mb::links::setLink (ch2, a, set[a]);
 
-            // 同码组快捷键同步：修改/清除快捷键时，同码（动作+字母+序号相同）
-            // 的通道一并写入，保证整组共用同一快捷键（链接码各自不变）。
+            // 同码组快捷键同步（按动作）：修改/清除快捷键时，该动作下同码
+            // （字母+序号相同）的通道一并写入，保证整组共用同一快捷键。
             int synced = 0;
-            if (s.bound())
+            for (int a = 0; a < mb::links::kActionCount; ++a)
+            {
+                const auto& s = set[a];
+                if (! s.bound()) continue;
                 for (int c = 0; c < graph_.channelCount(); ++c)
                 {
                     if (c == ch2) continue;
-                    const auto l = mb::links::linkOf (c);
-                    if (! l.bound() || l.action != s.action
-                        || l.letter != s.letter || l.index != s.index) continue;
+                    const auto l = mb::links::linkOf (c, a);
+                    if (! l.bound() || l.letter != s.letter || l.index != s.index) continue;
                     if (l.key == s.key && l.mods == s.mods) continue;
                     auto g = l; g.key = s.key; g.mods = s.mods;
-                    mb::links::setLink (c, g);
+                    mb::links::setLink (c, a, g);
                     if (c < static_cast<int> (strips_.size()))
                         strips_[static_cast<size_t> (c)]->invalidate();
                     ++synced;
                 }
+            }
 
             if (ch2 < static_cast<int> (strips_.size()))
                 strips_[static_cast<size_t> (ch2)]->invalidate();
             nodeCanvas_.repaint();
             dirty_ = true;
-            if (! s.bound() && ! s.hasHotkey())
+            if (set.empty())
             {
                 setMessage (mb::tr ("已清空快捷键与链接", "Hotkey & link cleared"));
             }
             else
             {
-                juce::String msg = mb::tr ("快捷键与链接已设置：", "Hotkey & link set: ")
-                                + (mb::links::hotkeyText (s).isNotEmpty()
-                                       ? mb::links::hotkeyText (s) + mb::S("  ") : juce::String())
-                                + mb::links::codeString (s)
-                                + (synced > 0
-                                       ? mb::tr ("（已同步到 ", " (synced to ")
-                                             + juce::String (synced) + mb::tr (" 个同码通道）",
-                                                                               " same-code channels)")
-                                       : juce::String());
-
-                // 应用后快捷键冲突复查：非同码通道共用按键时在状态栏警示
-                if (s.hasHotkey())
+                // 汇总各动作配置：动作名 + 快捷键 + 链接码
+                juce::String cfg;
+                for (int a = 0; a < mb::links::kActionCount; ++a)
                 {
-                    juce::StringArray mutexOthers, others;
+                    const auto& s = set[a];
+                    if (! s.bound() && ! s.hasHotkey()) continue;
+                    cfg += (cfg.isNotEmpty() ? mb::S ("  ·  ") : juce::String())
+                         + mb::links::actionName (a) + mb::S (" ")
+                         + (mb::links::hotkeyText (s).isNotEmpty()
+                                ? mb::links::hotkeyText (s) + mb::S (" ") : juce::String())
+                         + mb::links::codeString (s);
+                }
+                juce::String msg = mb::tr ("快捷键与链接已设置：", "Hotkey & link set: ") + cfg
+                                 + (synced > 0
+                                        ? mb::tr ("（已同步到 ", " (synced to ")
+                                              + juce::String (synced) + mb::tr (" 个同码通道)",
+                                                                                " same-code channels)")
+                                        : juce::String());
+
+                // 应用后快捷键冲突复查（跨动作汇总、通道名去重）：
+                // 非同码通道共用按键时在状态栏警示
+                juce::StringArray mutexOthers, others;
+                for (int a = 0; a < mb::links::kActionCount; ++a)
+                {
+                    const auto& s = set[a];
+                    if (! s.hasHotkey()) continue;
                     for (int c = 0; c < graph_.channelCount(); ++c)
                     {
                         if (c == ch2) continue;
-                        const auto l = mb::links::linkOf (c);
+                        const auto l = mb::links::linkOf (c, a);
                         if (! l.hasHotkey() || l.key != s.key || l.mods != s.mods) continue;
-                        if (l.bound() && l.action == s.action
-                            && l.letter == s.letter && l.index == s.index) continue;
+                        if (l.bound() && l.letter == s.letter && l.index == s.index) continue;
                         const auto n = mb::S ("CH") + juce::String (c + 1)
                                        + mb::S (" ") + mb::channelDisplayName (c);
-                        if (l.bound() && l.action == s.action && l.letter == s.letter)
-                            mutexOthers.add (n);
-                        else
-                            others.add (n);
+                        auto& bucket = (l.bound() && l.letter == s.letter) ? mutexOthers : others;
+                        if (! bucket.contains (n)) bucket.add (n);
                     }
-                    if (! mutexOthers.isEmpty() || ! others.isEmpty())
+                }
+                if (! mutexOthers.isEmpty() || ! others.isEmpty())
+                {
+                    juce::String warn = mb::tr (" ⚠ 与 ", " ⚠ shares key with ");
+                    if (! mutexOthers.isEmpty())
+                        warn += mb::tr ("互斥组通道 ", "mutex channels ")
+                                + mutexOthers.joinIntoString (mb::S ("、"));
+                    if (! others.isEmpty())
                     {
-                        juce::String warn = mb::tr (" ⚠ 与 ", " ⚠ shares key with ");
-                        if (! mutexOthers.isEmpty())
-                            warn += mb::tr ("互斥组通道 ", "mutex channels ")
-                                    + mutexOthers.joinIntoString (mb::S ("、"));
-                        if (! others.isEmpty())
-                        {
-                            if (! mutexOthers.isEmpty()) warn += mb::S ("；");
-                            warn += others.joinIntoString (mb::S ("、"));
-                        }
-                        warn += mb::tr (" 快捷键相同，按下会同时触发",
-                                        " — pressing triggers them together");
-                        msg += warn;
+                        if (! mutexOthers.isEmpty()) warn += mb::S ("；");
+                        warn += others.joinIntoString (mb::S ("、"));
                     }
+                    warn += mb::tr (" 快捷键相同，按下会同时触发",
+                                    " — pressing triggers them together");
+                    msg += warn;
                 }
                 setMessage (msg);
             }
@@ -3454,6 +3486,8 @@ private:
         dirty_ = false;
         presetDirty_ = false;
         savedSnapshot_ = snapshot;            // 显式保存点 = 「不保存」回滚基准
+        graph_.clearDroppedEdges();           // 已保存 = 文件与设备集一致，撤悬空角标
+        nodeCanvas_.repaint();
         setMessage (mb::tr ("预设已保存：", "Preset saved: ") + f.getFileName());
     }
 
@@ -3720,17 +3754,18 @@ private:
         juce::StringArray seen;
         const int n = graph_.channelCount();
         for (int c = 0; c < n; ++c)
-        {
-            const auto l = mb::links::linkOf (c);
-            if (! l.hasHotkey() || l.action == mb::links::kVolume) continue;  // 音量无翻转语义
-            const auto tag = juce::String (l.key) + mb::S(":") + juce::String (l.mods);
-            if (seen.contains (tag)) continue;
-            seen.add (tag);
-            bs.push_back ({ l.key, l.mods, [this, key = l.key, mods = l.mods]
+            for (int a = 0; a < mb::links::kActionCount; ++a)
             {
-                triggerLinkHotkey (juce::KeyPress (key, juce::ModifierKeys (mods), 0));
-            } });
-        }
+                const auto l = mb::links::linkOf (c, a);
+                if (! l.hasHotkey() || a == mb::links::kVolume) continue;  // 音量无翻转语义
+                const auto tag = juce::String (l.key) + mb::S(":") + juce::String (l.mods);
+                if (seen.contains (tag)) continue;
+                seen.add (tag);
+                bs.push_back ({ l.key, l.mods, [this, key = l.key, mods = l.mods]
+                {
+                    triggerLinkHotkey (juce::KeyPress (key, juce::ModifierKeys (mods), 0));
+                } });
+            }
 
         if (! hotkeyEngine_.setBindings (std::move (bs)))
             setMessage (mb::tr ("部分全局快捷键未生效：该按键不支持或钩子安装失败",
@@ -3745,7 +3780,7 @@ private:
         }
     }
 
-    /** 绑定指纹：设置页隐藏热键 + 每条通道快捷键（含动作，动作变化也重建）。 */
+    /** 绑定指纹：设置页隐藏热键 + 每条通道每个动作的快捷键（含动作，变化即重建）。 */
     juce::String currentHotkeyDigest() const
     {
         juce::String s = juce::String (settings_.hideHotkeyKey) + mb::S(":")
@@ -3754,12 +3789,13 @@ private:
                        + mb::S(":") + juce::String (settings_.unlockLyricsHotkeyMods);
         const int n = graph_.channelCount();
         for (int c = 0; c < n; ++c)
-        {
-            const auto l = mb::links::linkOf (c);
-            if (! l.hasHotkey() || l.action == mb::links::kVolume) continue;
-            s += mb::S("|") + juce::String (l.key) + mb::S(":")
-               + juce::String (l.mods) + mb::S(":") + juce::String (l.action);
-        }
+            for (int a = 0; a < mb::links::kActionCount; ++a)
+            {
+                const auto l = mb::links::linkOf (c, a);
+                if (! l.hasHotkey() || a == mb::links::kVolume) continue;
+                s += mb::S("|") + juce::String (l.key) + mb::S(":")
+                   + juce::String (l.mods) + mb::S(":") + juce::String (a);
+            }
         return s;
     }
 
@@ -3793,11 +3829,12 @@ private:
         if (settings_.hideHotkeyKey == key
             && hotkeyModMask (settings_.hideHotkeyMods) == mods) return true;
         for (int c = 0; c < graph_.channelCount(); ++c)
-        {
-            const auto l = mb::links::linkOf (c);
-            if (l.hasHotkey() && l.action != mb::links::kVolume
-                && l.key == key && hotkeyModMask (l.mods) == mods) return true;
-        }
+            for (int a = 0; a < mb::links::kActionCount; ++a)
+            {
+                const auto l = mb::links::linkOf (c, a);
+                if (a != mb::links::kVolume && l.hasHotkey()
+                    && l.key == key && hotkeyModMask (l.mods) == mods) return true;
+            }
         return false;
     }
 
@@ -3899,6 +3936,22 @@ private:
 
     //==========================================================================
     // 会话 / 预设
+
+    /** 预设体验 5b：装载后有因设备不匹配而未恢复的路由时，在消息条给出
+        完整提示（覆盖 prefix），NodeView 通道卡由 droppedChannels 驱动红色角标。
+        角标持续到用户重新保存预设（届时文件与当前设备集一致）为止。 */
+    void reportDroppedRoutes (const juce::String& prefix)
+    {
+        const int n = static_cast<int> (graph_.droppedEdges().size());
+        if (n <= 0) return;
+        setMessage (prefix + mb::tr (" —— ", " — ")
+                    + juce::String (n) + mb::tr (" 条路由因当前设备不匹配未恢复，"
+                    "节点视图已用红色 ! 角标标记相关通道；重新接线并保存预设后清除。",
+                    " route(s) not restored (device mismatch), marked with red "
+                    "! badges in Node View; re-wire and re-save the preset to clear."));
+        nodeCanvas_.repaint();
+    }
+
     bool tryRestoreSession()
     {
         const auto v = mb::SessionStore::load (mb::SessionStore::sessionFile());
@@ -3933,6 +3986,8 @@ private:
                     mb::AppSettings::save (settings_);
                     presetDirty_ = false;
                     savedSnapshot_ = mb::SessionStore::toJson (graph_, engine_, nodeCanvas_.layoutToJson());   // 导出 = 显式保存点
+                    graph_.clearDroppedEdges();        // 已保存 = 文件与设备集一致，撤悬空角标
+                    nodeCanvas_.repaint();
                     setMessage (mb::tr ("预设已导出：", "Preset saved: ") + f.getFileName());
                 }
                 else
@@ -3972,6 +4027,7 @@ private:
                     presetDirty_ = false;
                     savedSnapshot_ = mb::SessionStore::toJson (graph_, engine_, nodeCanvas_.layoutToJson());   // 导入 = 显式保存点
                     setMessage (mb::tr ("已导入预设：", "Preset loaded: ") + f.getFileName());
+                    reportDroppedRoutes (mb::tr ("已导入预设：", "Preset loaded: ") + f.getFileName());
                 }
                 else
                     setMessage (mb::tr ("预设导入失败（格式不正确）", "Preset import failed"));

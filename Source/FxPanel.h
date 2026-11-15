@@ -88,6 +88,8 @@ public:
                                    "Delay · no echo by default (feedback 0); raise feedback for echoes / space");
             case 8: return mb::tr ("tanh 饱和激励 · 增加密度与温暖感，适量即可",
                                    "tanh saturation · adds density & warmth, use in moderation");
+            case 10: return mb::tr ("源通道出声时自动压低本通道（音乐垫在人声之下） · 左栏选择源通道",
+                                    "Ducks this channel while the source speaks (music bed under voice) · pick source in the left rail");
             default: break;
         }
         return mb::tr ("信号链：门 → 高通 → EQ → 压缩 → 驱动 → 延迟 → 混响 → 限制器 · 双击推子回默认值",
@@ -241,6 +243,9 @@ public:
             resetBtn_.setBounds (card.getX() + 8,
                                  card.getBottom() - kRailBottom - 6 - 24,  // 左下角：卡片真·底部
                                  bw, 24);
+            // 闪避：源通道循环按钮放左栏中部（旁通之下、重置之上）
+            if (duckSrcBtn_ != nullptr && duckSrcBtn_->isVisible())
+                duckSrcBtn_->setBounds (card.getX() + 8, bypassBtn_.getBottom() + 8, bw, 24);
         }
         else
         {
@@ -542,6 +547,10 @@ private:
         setT (revToggle_, p.reverbOn);  set (revMix_, p.reverbMix);
         set (revSize_, p.reverbSize);
         setT (limToggle_, p.limitOn);   set (limCeil_, p.limitCeilDb);
+        setT (duckToggle_, p.duckOn);   set (duckThresh_, p.duckThreshDb);
+        set (duckDepth_, p.duckDepthDb); set (duckAtk_, p.duckAtkMs);
+        set (duckRel_, p.duckRelMs);
+        if (duckSrcRefresh_) duckSrcRefresh_();
     }
 
     void buildUi()
@@ -734,6 +743,67 @@ private:
             mods_.push_back ({ 6, t, nullptr, { { s, addLocalisedLabel ("上限", "Ceiling") } } });
         }
 
+        // ---- 侧链闪避 -------------------------------------------------------
+        if (all || fxSlot_ == 10)
+        {
+            // 源通道循环按钮（放左侧操作栏）：点击在 -1..15 间循环，一圈回到「未指定」
+            duckSrcRefresh_ = [this]
+            {
+                if (duckSrcBtn_ == nullptr) return;
+                const int s = engine_.fxParams (ch_).duckSrcCh;
+                duckSrcBtn_->setButtonText (mb::tr ("源: ", "Src: ")
+                    + (s < 0 ? mb::S("--") : mb::channelDisplayName (s)));
+            };
+            auto* src = new juce::TextButton();
+            duckSrcBtn_ = src;
+            src->setColour (juce::TextButton::buttonColourId, mb::ui::slotBg);
+            src->setColour (juce::TextButton::textColourOffId, mb::ui::subText);
+            src->setTooltip (mb::tr ("点击切换闪避源通道（源出声时压低本通道）",
+                                     "Click to cycle the ducking source channel"));
+            src->onClick = [this]
+            {
+                auto q = read();
+                int s = q.duckSrcCh < 0 ? 0 : q.duckSrcCh + 1;
+                if (s >= 16) s = -1;                    // 一圈回到「未指定」
+                q.duckSrcCh = s;
+                write (q);
+                if (duckSrcRefresh_) duckSrcRefresh_();
+            };
+            addAndMakeVisible (src);
+            owned_.add (src);
+            src->setVisible (fxSlot_ >= 0);   // 整链模式无左栏，源通道在单插件面板里选
+            textRefreshers_.push_back ([this] { if (duckSrcRefresh_) duckSrcRefresh_(); });
+
+            auto* t  = addToggle (mb::builtInPluginName (10), p.duckOn);
+            auto* sT = addFader (-60.0, 0.0, 0.5, p.duckThreshDb, mb::S(" dB"), -28.0);
+            auto* sD = addFader (-24.0, 0.0, 0.5, p.duckDepthDb, mb::S(" dB"), -12.0);
+            auto* sA = addFader (1.0, 100.0, 1.0, p.duckAtkMs, mb::S(" ms"), 15.0, 15.0);
+            auto* sR = addFader (50.0, 1500.0, 5.0, p.duckRelMs, mb::S(" ms"), 350.0, 350.0);
+            auto commit = [this, t, sT, sD, sA, sR]
+            {
+                auto q = read();
+                q.duckOn = t->getToggleState();
+                // 开启时未指定源或源是自身 → 自动指向下一个通道
+                if (q.duckOn && (q.duckSrcCh < 0 || q.duckSrcCh == ch_))
+                    q.duckSrcCh = (ch_ + 1) % 16;
+                q.duckThreshDb = static_cast<float> (sT->getValue());
+                q.duckDepthDb  = static_cast<float> (sD->getValue());
+                q.duckAtkMs    = static_cast<float> (sA->getValue());
+                q.duckRelMs    = static_cast<float> (sR->getValue());
+                write (q);
+            };
+            t->onStateChange = commit;
+            sT->onValueChange = commit; sD->onValueChange = commit;
+            sA->onValueChange = commit; sR->onValueChange = commit;
+            duckToggle_ = t; duckThresh_ = sT; duckDepth_ = sD;
+            duckAtk_ = sA; duckRel_ = sR;
+            mods_.push_back ({ 10, t, nullptr,
+                { { sT, addLocalisedLabel ("阈值", "Threshold") },
+                  { sD, addLocalisedLabel ("压低量", "Depth") },
+                  { sA, addLocalisedLabel ("启动", "Attack") },
+                  { sR, addLocalisedLabel ("释放", "Release") } } });
+        }
+
         // 单效果模式：内置插件已拆成独立面板，模块勾选框 + 插件标题不再需要
         // （开关由左上角「旁通」接管）。整链模式仍保留模块标题区分 8 个模块。
         if (fxSlot_ >= 0)
@@ -798,6 +868,9 @@ private:
             case 7: q.delayMs = d.delayMs; q.delayFb = d.delayFb;
                     q.delayMix = d.delayMix; break;
             case 8: q.driveAmt = d.driveAmt; q.driveMix = d.driveMix; break;
+            case 10: q.duckThreshDb = d.duckThreshDb; q.duckDepthDb = d.duckDepthDb;
+                     q.duckAtkMs = d.duckAtkMs;       q.duckRelMs = d.duckRelMs;
+                     break;                            // 源通道是接线意图，重置不动它
             default: break;
         }
         return q;
@@ -823,6 +896,11 @@ private:
     juce::ToggleButton* revToggle_ = nullptr;
     juce::Slider* revMix_ = nullptr, *revSize_ = nullptr;
     juce::ToggleButton* limToggle_ = nullptr;   juce::Slider* limCeil_ = nullptr;
+    juce::ToggleButton* duckToggle_ = nullptr;
+    juce::Slider* duckThresh_ = nullptr, *duckDepth_ = nullptr;
+    juce::Slider* duckAtk_ = nullptr, *duckRel_ = nullptr;
+    juce::TextButton* duckSrcBtn_ = nullptr;    // 闪避源通道循环按钮（左栏）
+    std::function<void()> duckSrcRefresh_;      // 文本随参数/语言刷新
 
     JUCE_DECLARE_NON_COPYABLE (FxPanel)
 };

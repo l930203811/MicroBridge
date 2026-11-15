@@ -21,6 +21,9 @@
 //     录入相同快捷键的通道构成快捷键触发组（按动作整组翻转）。
 //   · 录入的快捷键由 MainComponent 注册为系统级全局热键（其它程序前台按下
 //     也生效）；同码共享组共用一个键，只注册一次，命中时整组翻转。
+//
+// 每个动作（开关/音量/效果/显示/独奏）各有一条独立配置：链接码与快捷键
+// 都随动作分开设置 —— 开关可绑 A1+Ctrl+F1，效果同时绑 B2+Alt+E，互不影响。
 //==============================================================================
 namespace mb::links
 {
@@ -54,27 +57,83 @@ namespace mb::links
         bool hasHotkey() const noexcept { return key != 0; }
     };
 
-    /** 每通道一条的链接表（下标 = 通道序号）。 */
-    inline std::vector<LinkSpec>& table() noexcept
+    /** 每通道一条的链接表（下标 = 通道序号）：每个动作各一条独立配置。 */
+    struct LinkSet
     {
-        static std::vector<LinkSpec> v;
+        LinkSpec per[kActionCount];              // 下标 = 动作（Action 枚举值）
+        const LinkSpec& operator[] (int a) const noexcept { return per[a]; }
+        LinkSpec&       operator[] (int a)       noexcept { return per[a]; }
+        bool empty() const noexcept
+        {
+            for (const auto& s : per) if (s.bound() || s.hasHotkey()) return false;
+            return true;
+        }
+    };
+
+    inline std::vector<LinkSet>& table() noexcept
+    {
+        static std::vector<LinkSet> v;
         return v;
     }
 
     inline void resize (int channels) { table().resize (static_cast<size_t> (juce::jmax (0, channels))); }
 
-    inline LinkSpec linkOf (int ch)
+    /** 读取通道某动作的配置（越界返回默认值）。 */
+    inline LinkSpec linkOf (int ch, int action)
     {
         const auto& t = table();
-        return (ch >= 0 && ch < static_cast<int> (t.size())) ? t[static_cast<size_t> (ch)] : LinkSpec{};
+        if (ch < 0 || ch >= static_cast<int> (t.size())) return LinkSpec{};
+        const int a = juce::jlimit (0, kActionCount - 1, action);
+        return t[static_cast<size_t> (ch)].per[a];
     }
 
-    inline void setLink (int ch, const LinkSpec& s)
+    /** 写入通道某动作的配置（action 字段与存储槽位保持一致）。 */
+    inline void setLink (int ch, int action, const LinkSpec& s)
+    {
+        if (ch < 0) return;
+        auto& t = table();
+        if (static_cast<int> (t.size()) <= ch) t.resize (static_cast<size_t> (ch) + 1);
+        const int a = juce::jlimit (0, kActionCount - 1, action);
+        auto out = s;
+        out.action = a;
+        t[static_cast<size_t> (ch)].per[a] = out;
+    }
+
+    /** 整组读取（通道重排 / 复制用）。 */
+    inline LinkSet linkSetOf (int ch)
+    {
+        const auto& t = table();
+        return (ch >= 0 && ch < static_cast<int> (t.size())) ? t[static_cast<size_t> (ch)] : LinkSet{};
+    }
+
+    /** 整组写入。 */
+    inline void setLinkSet (int ch, const LinkSet& s)
     {
         if (ch < 0) return;
         auto& t = table();
         if (static_cast<int> (t.size()) <= ch) t.resize (static_cast<size_t> (ch) + 1);
         t[static_cast<size_t> (ch)] = s;
+    }
+
+    /** 聚合显示用：第一条已绑定或已设快捷键的配置（按动作序优先）。 */
+    inline LinkSpec primaryOf (int ch)
+    {
+        const auto& t = table();
+        if (ch < 0 || ch >= static_cast<int> (t.size())) return LinkSpec{};
+        for (int a = 0; a < kActionCount; ++a)
+        {
+            const auto& s = t[static_cast<size_t> (ch)].per[a];
+            if (s.bound() || s.hasHotkey()) return s;
+        }
+        return LinkSpec{};
+    }
+
+    /** 通道是否有任何动作绑定了链接码或快捷键。 */
+    inline bool anyBound (int ch)
+    {
+        const auto& t = table();
+        if (ch < 0 || ch >= static_cast<int> (t.size())) return false;
+        return ! t[static_cast<size_t> (ch)].empty();
     }
 
     inline juce::String letterName (int letter)

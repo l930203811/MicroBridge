@@ -114,6 +114,103 @@ public:
 };
 
 //==============================================================================
+// 通道声像条：推子卡内 dB 读数下方的水平 Pan 条。
+// 等功率增益在 RouteGraph::compile() 生效，此处只负责 -1..+1 取值与显示。
+// 拖动手柄实时写入 graph（与推子同模式）；双击归中；值标签 C / Lxx / Rxx
+// 画在手柄空侧，避免重叠。
+//==============================================================================
+class PanBar : public juce::Component
+{
+public:
+    mb::RouteGraph* graph = nullptr;
+    int index = -1;
+    juce::Colour accent = mb::ui::accent[0];
+    std::function<void()> onGestureEnd;   // 拖动结束 / 双击归中后通知（脏标记）
+
+    PanBar() { setMouseCursor (juce::MouseCursor::LeftRightResizeCursor); }
+
+    void paint (juce::Graphics& g) override
+    {
+        if (graph == nullptr) return;
+        const auto b = getLocalBounds().toFloat();
+        const float a = graph->isEnabled (index) ? 1.0f : 0.40f;
+
+        // 轨道槽
+        g.setColour (mb::ui::slotBg.withAlpha (a));
+        g.fillRoundedRectangle (b, 4.0f);
+        g.setColour (mb::ui::border.withAlpha (a));
+        g.drawRoundedRectangle (b.reduced (0.5f), 4.0f, 0.8f);
+
+        // 中点刻度
+        g.setColour (mb::ui::faintText.withAlpha (a));
+        g.fillRect (b.getCentreX() - 0.5f, b.getY() + 2.5f, 1.0f, b.getHeight() - 5.0f);
+
+        // 手柄：底部投影 + 通道色（居中为主题色，偏移后跟随通道色）
+        const float pv = graph->pan (index);
+        const float t = (pv + 1.0f) * 0.5f;
+        const float hw = 12.0f;
+        const auto handle = juce::Rectangle<float> (
+            b.getX() + t * (b.getWidth() - hw), b.getY() + 1.5f, hw, b.getHeight() - 3.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.40f * a));
+        g.fillRoundedRectangle (handle.translated (0.0f, 1.0f), 3.0f);
+        g.setColour ((std::abs (pv) < 0.005f ? mb::ui::text : accent).withAlpha (a));
+        g.fillRoundedRectangle (handle, 3.0f);
+        g.setColour (mb::ui::border.withAlpha (a));
+        g.drawRoundedRectangle (handle.reduced (0.5f), 3.0f, 0.8f);
+
+        // 值标签：画在手柄的另一侧
+        const int pct = juce::roundToInt (std::abs (pv) * 100.0f);
+        const auto label = pct == 0 ? mb::S("C")
+            : (pv < 0.0f ? mb::S("L") : mb::S("R")) + juce::String (pct);
+        const auto labelRect = (t < 0.5f)
+            ? juce::Rectangle<float> (handle.getRight() + 2.0f, b.getY(),
+                                      b.getRight() - handle.getRight() - 2.0f, b.getHeight())
+            : juce::Rectangle<float> (b.getX(), b.getY(),
+                                      handle.getX() - b.getX() - 2.0f, b.getHeight());
+        if (labelRect.getWidth() > 12.0f)
+        {
+            g.setFont (mb::ui::font (7.5f, true));
+            g.setColour (mb::ui::faintText.withAlpha (a));
+            g.drawText (label, labelRect.toNearestInt(), juce::Justification::centred, false);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& ev) override
+    {
+        // 触控板长按会被 Windows 翻译成右键，声像条只接受左键
+        if (graph == nullptr || ev.mods.isPopupMenu() || ev.mods.isRightButtonDown()) return;
+        dragging_ = true;
+        apply (ev.position.x);
+    }
+    void mouseDrag (const juce::MouseEvent& ev) override
+    {
+        if (dragging_) apply (ev.position.x);
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (dragging_ && onGestureEnd) onGestureEnd();
+        dragging_ = false;
+    }
+    void mouseDoubleClick (const juce::MouseEvent& ev) override
+    {
+        if (graph == nullptr || ev.mods.isRightButtonDown()) return;
+        graph->setPan (index, 0.0f);
+        repaint();
+        if (onGestureEnd) onGestureEnd();
+    }
+
+private:
+    void apply (float x)
+    {
+        const float w = static_cast<float> (getWidth());
+        const float t = juce::jlimit (0.0f, 1.0f, (x - 6.0f) / juce::jmax (1.0f, w - 12.0f));
+        graph->setPan (index, t * 2.0f - 1.0f);
+        repaint();
+    }
+    bool dragging_ = false;
+};
+
+//==============================================================================
 // 快捷键与链接角标按钮：四个按钮（M S / R 喇叭）正中间的空档，上下两行：
 //   上行：已绑定 = 分组名（如 A1）；未绑定 = 链形图标 🔗
 //   下行：已设快捷键 = 快捷键文本；未设 = 键盘图标 ⌨️
@@ -130,9 +227,21 @@ public:
     void paint (juce::Graphics& g) override
     {
         auto r = getLocalBounds().toFloat().reduced (1.0f);
-        const auto link = mb::links::linkOf (channelIndex);
-        const auto code = mb::links::codeString (link);
-        const auto hk   = mb::links::hotkeyText (link);
+        // 聚合显示：取第一条已配置动作的码/键；配置了多个动作时追加 "+" 角标
+        const auto link = mb::links::primaryOf (channelIndex);
+        auto code = mb::links::codeString (link);
+        auto hk   = mb::links::hotkeyText (link);
+        int cfgCount = 0;
+        for (int a = 0; a < mb::links::kActionCount; ++a)
+        {
+            const auto l = mb::links::linkOf (channelIndex, a);
+            if (l.bound() || l.hasHotkey()) ++cfgCount;
+        }
+        if (cfgCount > 1)
+        {
+            if (code.isNotEmpty()) code += mb::S("+");
+            if (hk.isNotEmpty())   hk   += mb::S("+");
+        }
         const bool hover = isMouseOver();
 
         if (code.isNotEmpty() || hk.isNotEmpty() || hover)
@@ -291,6 +400,13 @@ public:
         fader_.addListener (this);
         addAndMakeVisible (fader_);
 
+        // 声像条：推子卡内 dB 读数下方，拖动实时写 graph，双击归中
+        panBar_.graph = &graph_;
+        panBar_.index = index_;
+        panBar_.accent = accent_;
+        panBar_.onGestureEnd = [this] { if (onChanged) onChanged(); };
+        addAndMakeVisible (panBar_);
+
         muteBtn_.glyph = mb::S("M");
         muteBtn_.colour = mb::ui::meterRed;
         muteBtn_.isToggle = true;
@@ -390,6 +506,7 @@ public:
     {
         if (foldedCompact_ == f) return;
         foldedCompact_ = f;
+        panBar_.setVisible (! f);       // 折叠态连声像条一起隐藏
         metersIdle_ = false;            // 展开后重新起跳，避免残留的静默跳过
         repaint();
     }
@@ -423,13 +540,10 @@ public:
                 la = mb::ui::levelToMeter (engine_.channelPeakL (index_));
                 lb = mb::ui::levelToMeter (engine_.channelPeakR (index_));
             }
-            else if (stereoPair)
-            {
-                la = mb::ui::levelToMeter (juce::jmax (engine_.inputPortPeak (pa) * fg, total));
-                lb = mb::ui::levelToMeter (juce::jmax (engine_.inputPortPeak (pb) * fg, total));
-            }
             else if (pa >= 0)
             {
+                // 单声道通道：永远单条（跟随通道制式）。双通道设备接入时
+                // 内核已把 L+R 求和进通道 L 缓冲，total 即为通道真实内容。
                 la = mb::ui::levelToMeter (juce::jmax (engine_.inputPortPeak (pa) * fg, total));
             }
             else
@@ -442,8 +556,8 @@ public:
         if (idle && metersIdle_) return;         // 已静默且画过最后一帧 → 零开销
         metersIdle_ = idle;
 
-        const int top = juce::roundToInt (faderRegion_.getY()) + 20;
-        const int hgt = juce::roundToInt (faderRegion_.getHeight()) - 32;
+        const int top = juce::roundToInt (faderRegion_.getY()) + 38;
+        const int hgt = juce::roundToInt (faderRegion_.getHeight()) - 44;
         repaint (juce::Rectangle<int> (18, top, 25, juce::jmax (20, hgt)));
     }
 
@@ -456,6 +570,8 @@ public:
             cols.resize (static_cast<size_t> (index_ + 1));
         cols[static_cast<size_t> (index_)] = accent_;
         lf_.thumb = accent_;                      // 推子仍跟随通道色
+        panBar_.accent = accent_;                 // 声像手柄跟随通道色
+        panBar_.repaint();
         spkBtn_.colour = mb::ui::accent[6];       // 喇叭键帽恒定，不受换色影响
         updateDim();
         changed (mb::tr ("已更换通道颜色", "Colour updated"));
@@ -507,6 +623,8 @@ public:
     {
         accent_ = mb::ui::stripColour (index_);           // 颜色可能被会话/预设更新
         iconId_ = mb::channelIcon (index_);               // 图标随会话/预设恢复
+        panBar_.index = index_;
+        panBar_.accent = accent_;
         spkBtn_.colour = mb::ui::accent[6];       // 喇叭键帽不与通道色联动
         muteBtn_.state = graph_.isMuted (index_);
         soloBtn_.state = graph_.isSolo (index_);
@@ -677,7 +795,8 @@ public:
     {
         staticDirty_ = true;                 // 尺寸变化 → 静态层缓存重建
         const auto L = computeLayout();
-        fader_.setBounds (getWidth() - 34, L.yFd + 22, 26, juce::jmax (40, L.hFd - 36));   // 推子靠推子卡右缘
+        panBar_.setBounds (8, L.yFd + 21, getWidth() - 16, 13);   // dB 读数下方横贯声像条
+        fader_.setBounds (getWidth() - 34, L.yFd + 40, 26, juce::jmax (40, L.hFd - 54));   // 推子靠推子卡右缘（声像条下方）
 
         const int gridTop = getHeight() - mb::ui::kNameBandHeight - kButtonGridH + 3;
         muteBtn_.setBounds (4,  gridTop,      22, 22);   // 上行：M S（左右拉开）
@@ -1516,8 +1635,8 @@ private:
                     region.getX(), y + 2, region.getWidth(), 17,
                     juce::Justification::centred, false);
 
-        const int faderTop = y + 22;
-        const int faderH = cardH - 36;
+        const int faderTop = y + 40;         // dB 读数(2..19) + 声像条(21..34) 之下
+        const int faderH = cardH - 56;
         if (faderH < 40) return;
 
         // 左侧参考值刻度（电平表与推子共用同一 dB 纵轴；与内置插件共用绘制函数）
@@ -1592,24 +1711,10 @@ private:
             g.drawText (mb::S("R"), meterX + barW + gap - 1, faderTop + faderH + 2, barW + 2, 8,
                         juce::Justification::centred, false);
         }
-        else if (stereoPair)
-        {
-            // 单声道通道但输入是立体声端口对：仍按端口 L/R 显示双条
-            const float lPeak = juce::jmax ((pa >= 0 ? engine_.inputPortPeak (pa) : 0.0f) * fg,
-                                            totalPeak);
-            const float rPeak = juce::jmax ((pb >= 0 ? engine_.inputPortPeak (pb) : 0.0f) * fg,
-                                            totalPeak);
-            drawBar (meterX, lPeak, 0);
-            drawBar (meterX + barW + gap, rPeak, 1);
-            g.setFont (mb::ui::font (6.5f, true));
-            g.setColour (mb::ui::faintText);
-            g.drawText (mb::S("L"), meterX - 1, faderTop + faderH + 2, barW + 2, 8,
-                        juce::Justification::centred, false);
-            g.drawText (mb::S("R"), meterX + barW + gap - 1, faderTop + faderH + 2, barW + 2, 8,
-                        juce::Justification::centred, false);
-        }
         else if (pa >= 0)
         {
+            // 单声道通道：永远单条（跟随通道制式）。双通道设备接入时内核已把
+            // L+R 求和进通道 L 缓冲，单条即通道真实内容，不再按端口显示双条。
             drawBar (meterX + 5, juce::jmax (engine_.inputPortPeak (pa) * fg, totalPeak), 0);
         }
         else
@@ -2029,7 +2134,7 @@ private:
 
         m.addSeparator();
         {
-            const auto link = mb::links::linkOf (index_);
+            const auto link = mb::links::primaryOf (index_);
             const auto hk   = mb::links::hotkeyText (link);
             const auto code = mb::links::codeString (link);
             const auto suffix = hk.isNotEmpty() ? mb::S("  (") + hk + mb::S(")")
@@ -2607,6 +2712,7 @@ public:
 
     FaderLookAndFeel lf_;
     juce::Slider fader_;
+    PanBar panBar_;               // 推子卡内声像条（双击归中）
     RoundButton muteBtn_, soloBtn_, recBtn_, spkBtn_;
     LinkBadgeButton linkBadge_;   // 快捷键与链接角标（键盘图标 / 快捷键 / 链接码）
     RoundButton monoBtn_;         // 头部「声道制式」切换（L+R = 立体声 / L = 单声道）

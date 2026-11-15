@@ -156,6 +156,9 @@ namespace mb
         int underruns_ = 0, overflows_ = 0;
     };
 
+    // LoopbackDevice.h 依赖上面的 StreamRing，在此包含（先于 AuxDevice）
+    #include "LoopbackDevice.h"
+
     //--------------------------------------------------------------------------
     /** 一个辅助设备（非主设备）。输出 = 播放宿，输入 = 采集源。 */
     class AuxDevice : public juce::AudioIODeviceCallback
@@ -167,6 +170,27 @@ namespace mb
               masterRate_ (masterRate > 0.0 ? masterRate : 48000.0),
               masterBuffer_ (masterBuffer > 0 ? masterBuffer : 256)
         {
+            // 系统声音回环（虚拟设备）：不走 juce 设备栈，由独立 WASAPI
+            // 捕获线程灌 inRing_；pullInput 与普通辅助输入同一条 ASRC 路径。
+            if (entry.isLoopback)
+            {
+                loop_ = std::make_unique<LoopbackDevice>();
+                nIn_  = juce::jlimit (1, 2, entry.inputChannels);
+                nOut_ = 0;
+                inPtrs_.resize  (static_cast<size_t> (juce::jmax (1, nIn_)),  nullptr);
+                outPtrs_.resize (static_cast<size_t> (juce::jmax (1, nOut_)), nullptr);
+                inRing_.prepare  (juce::jmax (1, nIn_), 14);
+                outRing_.prepare (juce::jmax (1, nOut_), 14);
+                dummy_.resize (8192, 0.0f);
+                targetFill_ = static_cast<double> (juce::jmax (1024, masterBuffer_ * 4));
+                loop_->setSink (&inRing_);
+                deviceRate_ = loop_->sampleRate();
+                if (deviceRate_ <= 0.0) deviceRate_ = masterRate_;
+                if (loop_->ok()) opened_ = true;
+                else               error_ = loop_->error();
+                return;
+            }
+
             auto* type = typeFor (dm, entry.typeIndex);
             if (type == nullptr)
             {
@@ -241,6 +265,7 @@ namespace mb
                 device_->close();
             }
             opened_ = false;
+            loop_.reset();      // 回环捕获线程随 AuxDevice 一起停
         }
 
         bool opened() const noexcept { return opened_; }
@@ -340,6 +365,7 @@ namespace mb
         }
 
         bool needInput_, needOutput_, opened_ = false;
+        std::unique_ptr<LoopbackDevice> loop_;      // 回环模式专用（device_ 为空）
         double masterRate_, deviceRate_, targetFill_;
         int masterBuffer_;
         int nIn_ = 0, nOut_ = 0;
@@ -724,6 +750,36 @@ namespace mb
             return true;
         }
 
+        /** 设备热刷新：重新枚举驱动与设备并重编端口（不中断当前音频、
+            不重开主设备）。scan 会清掉主设备标记与真实通道名，这里按当前
+            生效配置回填；probeType 非空时额外惰性探测该驱动类型下非 ASIO
+            设备的真实通道。运行中最后走 syncDevices() 重建辅助流与路由
+            （设备枚举顺序变化时它会按新 di 重新匹配/重开辅助设备）。
+            控制线程调用（Setup 对话框「刷新」按钮 / 打开 / 换驱动）。 */
+        void rescanDevices (const juce::String& probeType = {})
+        {
+            catalog_.scan (deviceManager_);
+
+            const auto applied    = deviceManager_.getAudioDeviceSetup();
+            const auto masterType = deviceManager_.getCurrentAudioDeviceType();
+            catalog_.markMaster (masterType, applied.inputDeviceName, applied.outputDeviceName);
+
+            juce::StringArray inNames, outNames;
+            if (auto* cur = deviceManager_.getCurrentAudioDevice())
+            {
+                inNames  = cur->getInputChannelNames();
+                outNames = cur->getOutputChannelNames();
+            }
+            catalog_.setMasterChannels (masterType, applied.inputDeviceName,
+                                        applied.outputDeviceName, inNames, outNames);
+
+            if (probeType.isNotEmpty())
+                catalog_.probeTypeChannels (deviceManager_, probeType);
+
+            graph_.setPortCounts (catalog_.inputPortCount(), catalog_.outputPortCount());
+            syncDevices();
+        }
+
         /** 按当前图的连边，懒打开/关闭非主设备；控制线程调用。
             虚拟时钟模式下整个重建过程暂停处理，避免音频线程读到半更新的缓冲。 */
         void syncDevices()
@@ -889,6 +945,7 @@ namespace mb
                 if (std::abs (sr - fxPreparedSr_) > 1.0)
                 {
                     fxBank_.prepare (sr, kMaxBlock);
+                    duckGain_.fill (1.0f);
                     fxPreparedSr_ = sr;
                     recorder_.setSampleRate (sr);
                     recScratch_.assign (static_cast<size_t> (kMaxChannels),
@@ -1004,6 +1061,54 @@ namespace mb
                 pluginBank_.processChannel (c,
                                             channels_[static_cast<size_t> (2 * c)].data(),
                                             channels_[static_cast<size_t> (2 * c + 1)].data(), n);
+
+            // 3.7) 侧链闪避（引擎层跨通道 DSP）：源通道出声时自动压低本通道。
+            //      检测取源通道（已过效果链 / 插件链）的块内峰值；闪避增益按块
+            //      平滑（attack/release），块内线性斜坡防 zipper 噪声。
+            //      插在 C→C 之前：被闪避通道流向总线的信号同步被压低。
+            if (const auto fx = fxBank_.snapshot())
+            {
+                const double sr = sampleRate() > 0.0 ? sampleRate() : 48000.0;
+                for (int d = 0; d < nCh; ++d)
+                {
+                    const auto& p = fx->params[static_cast<size_t> (d)];
+                    const int s = p.duckSrcCh;
+                    if (! p.duckOn || s < 0 || s >= nCh || s == d) continue;
+
+                    // 检测：源通道块内峰值
+                    const float* sbL = channels_[static_cast<size_t> (2 * s)].data();
+                    const float* sbR = channels_[static_cast<size_t> (2 * s + 1)].data();
+                    float peak = 0.0f;
+                    for (int i = 0; i < n; ++i)
+                        peak = juce::jmax (peak, std::fabs (sbL[i]), std::fabs (sbR[i]));
+                    const float db = 20.0f * std::log10 (juce::jmax (peak, 1.0e-6f));
+
+                    // 闪避量：超过阈值 6 dB 内线性逼近全深度（防阈值附近抖动）
+                    const float over = juce::jlimit (0.0f, 6.0f, db - p.duckThreshDb);
+                    const float depthLin = std::pow (10.0f,
+                        juce::jlimit (-24.0f, 0.0f, p.duckDepthDb) / 20.0f);
+                    const float target = over <= 0.0f
+                        ? 1.0f : 1.0f + (depthLin - 1.0f) * (over / 6.0f);
+
+                    // 块间平滑 + 块内线性斜坡
+                    const float g0 = duckGain_[static_cast<size_t> (d)];
+                    const double ms = juce::jmax (1.0, static_cast<double> (
+                        target < g0 ? p.duckAtkMs : p.duckRelMs));
+                    const float coef = static_cast<float> (
+                        1.0 - std::exp (-1.0 / (ms * 0.001 * sr)));
+                    const float g1 = g0 + (target - g0) * coef;
+                    float* dL = channels_[static_cast<size_t> (2 * d)].data();
+                    float* dR = channels_[static_cast<size_t> (2 * d + 1)].data();
+                    const float inc = (g1 - g0) / static_cast<float> (juce::jmax (1, n));
+                    for (int i = 0; i < n; ++i)
+                    {
+                        const float g = g0 + inc * static_cast<float> (i);
+                        dL[i] *= g;
+                        dR[i] *= g;
+                    }
+                    duckGain_[static_cast<size_t> (d)] = g1;
+                }
+            }
 
             // 4) C -> C：已按拓扑序排好，src 的贡献先于 dst 的出边（缓冲索引）
             for (const auto& e : plan->channelSends)
@@ -1350,6 +1455,7 @@ namespace mb
 
         // 通道效果链 / 录音 / VST3 插件
         mb::ChannelFxBank fxBank_;
+        std::array<float, 32> duckGain_ {};     // 侧链闪避当前增益（音频线程，1 = 不闪避）
         mb::ChannelRecorder recorder_;
         mb::PluginCatalog pluginCatalog_;
         mb::ChannelPluginBank pluginBank_;

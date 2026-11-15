@@ -727,6 +727,7 @@ public:
         refreshTabStyles();
         for (auto* c : { &fmtCombo_, &bitsCombo_, &srCombo_, &modeCombo_, &scaleCombo_ })
             styleComboColour (*c);
+        devicePage_->refreshThemeColours();   // 内嵌设备页按钮/标签/下拉跟随主题
         repaint();
     }
 

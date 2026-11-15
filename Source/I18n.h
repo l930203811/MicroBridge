@@ -73,7 +73,16 @@ namespace mb
 
     inline constexpr int kMaxNamedChannels = 12;
 
+    /** 通道默认名：一律 CH 编号。预设体验 5a —— 用户自建空白预设时不再看到
+        「系统/伴奏/麦克风」等语义名（那是本机预设的语义，不该强加给所有人）；
+        语义名只由「重置路由」通过 defaultLiveChannelName 显式写入。 */
     inline juce::String channelName (int index)
+    {
+        return S("CH") + juce::String (index + 1);
+    }
+
+    /** 「重置路由」直播默认配线配套的语义通道名（显式写入 customChannelNames）。 */
+    inline juce::String defaultLiveChannelName (int index)
     {
         static const NamedItem names[kMaxNamedChannels] =
         {
@@ -89,7 +98,7 @@ namespace mb
         if (index >= 0 && index < kMaxNamedChannels)
             return tr (names[index].zh, names[index].en);
 
-        return S("CH") + juce::String (index + 1);
+        return channelName (index);
     }
 
     // ---- 用户自定义通道名（重命名后优先显示；空串回退到默认名）------------
