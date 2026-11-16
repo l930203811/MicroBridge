@@ -1,0 +1,47 @@
+name: CI
+
+# 微音桥（MicroBridge）核心回归：路由内核 + 录音链路单元测试。
+# 只构建测试目标（MICROBRIDGE_BUILD_APP=OFF），不需要 ASIO SDK /
+# Media Foundation / VST3 SDK，干净 Windows runner 即可跑通。
+# GUI app 的真机长跑与延迟测量不在此处，需人工验证。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+
+    steps:
+      - name: Checkout MicroBridge
+        uses: actions/checkout@v4
+
+      # JUCE 不随仓库分发（轻量化），从官方 tag 拉到 juce/ 子目录。
+      - name: Checkout JUCE 8.0.15
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 8.0.15
+          path: juce
+          fetch-depth: 1
+
+      - name: Configure
+        run: >
+          cmake -G Ninja -B build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DJUCE_DIR="${{ github.workspace }}/juce"
+          -DMICROBRIDGE_BUILD_APP=OFF
+
+      - name: Build tests
+        run: cmake --build build --config ${{ matrix.build_type }} --target RouteGraphTest ChannelRecorderTest
+
+      - name: Run tests (ctest)
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure

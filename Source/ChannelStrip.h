@@ -1202,9 +1202,14 @@ private:
             return juce::jlimit (minH, 600, s > 0 ? s : def);
         };
 
-        int hOut = grab (2, 48, 34);
         int hFd  = grab (3, avail / 2, 120);
         int hPl  = grab (1, 100, 44);
+        // 「+ 输入 / + 输出」默认等高：输出区未被手动拖动过时，与输入区对半
+        // 分配剩余空间，避免输出区只有 48px 而输入区很高、两栏看起来不齐。
+        // 用户拖过输出区后仍以存储值为准（输入区吸收剩余）。
+        const int storedOut = stored (2);
+        int hOut = storedOut > 0 ? juce::jlimit (34, 600, storedOut)
+                                 : juce::jmax (34, (avail - hPl - hFd) / 2);
         int hIn  = avail - hPl - hOut - hFd;
 
         if (hIn < 34) { hFd  = juce::jmax (120, hFd  - (34 - hIn)); hIn = avail - hPl - hOut - hFd; }
@@ -1381,9 +1386,22 @@ private:
         aga.addLineOfText (addF, addTxt, 0.0f, 0.0f);
         const float addTw = aga.getNumGlyphs() > 0
                               ? aga.getBoundingBox (0, aga.getNumGlyphs(), true).getWidth() : 28.0f;
-        const auto add = juce::Rectangle<float> (region.getX() + 6.0f, region.getY() + 2.0f,
-                                                 juce::jmin (region.getWidth() - 12.0f, addTw + 16.0f),
-                                                 14.0f);
+        // 与「+ 输入 / + 输出」按钮的文字起点对齐：源区按钮是整宽居中排版
+        // （region.x+5、宽 region.w-10、字号 8.8），插件键帽保持按文本收紧的宽度，
+        // 只平移 x 让两个「+」落在同一竖线上，避免「+ 插件」看起来贴左。
+        const auto srcF = mb::ui::font (8.8f, true);
+        juce::GlyphArrangement sga;
+        sga.addLineOfText (srcF, mb::S("+  ") + mb::tr ("输入", "Input"), 0.0f, 0.0f);
+        const float srcTw = sga.getNumGlyphs() > 0
+                              ? sga.getBoundingBox (0, sga.getNumGlyphs(), true).getWidth() : 38.0f;
+        const float srcTextX = region.getX() + 5.0f
+                             + juce::jmax (0.0f, region.getWidth() - 10.0f - srcTw) * 0.5f;
+        const float addW = juce::jmin (region.getWidth() - 12.0f, addTw + 16.0f);
+        const float addX = juce::jlimit (region.getX() + 2.0f,
+                                         region.getRight() - addW - 2.0f,
+                                         srcTextX - (addW - addTw) * 0.5f);
+        const auto add = juce::Rectangle<float> (addX, region.getY() + 2.0f,
+                                                 addW, 14.0f);
         pluginAdd_ = add;
         // 物理键帽：投影 + 渐变帽体 + 顶缘高光，中性灰描边与文字（不跟随通道色）
         g.setColour (juce::Colours::black.withAlpha (0.38f));

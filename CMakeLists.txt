@@ -14,6 +14,10 @@ if (NOT EXISTS "${JUCE_DIR}/CMakeLists.txt")
 endif()
 add_subdirectory("${JUCE_DIR}" "${CMAKE_BINARY_DIR}/juce")
 
+# CI / 纯测试构建：关掉 GUI app 可避开 ASIO SDK 与 Media Foundation 等平台依赖，
+# 只编译路由内核与录音回读测试（本地开发保持 ON）。
+option(MICROBRIDGE_BUILD_APP "Build the MicroBridge GUI application" ON)
+
 # 不引入：ONNX Runtime / AI 模型 / VST3 宿主 SDK / Media Foundation / 虚拟声卡驱动。
 # 只使用 JUCE 的设备 I/O、GUI 与基础 DSP 模块。
 # JUCE_ASIO 默认关闭，这里显式打开以支持启动时选择 ASIO 驱动；
@@ -30,7 +34,28 @@ target_link_libraries(RouteGraphTest PRIVATE RouteGraph)
 target_compile_options(RouteGraphTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 add_test(NAME RouteGraphTest COMMAND RouteGraphTest)
 
+# ---- 录音链路：真实写盘 + reader 回读，覆盖 Sum/MultiTrack 与格式矩阵 ----
+juce_add_console_app(ChannelRecorderTest PRODUCT_NAME "ChannelRecorderTest")
+juce_generate_juce_header(ChannelRecorderTest)
+target_sources(ChannelRecorderTest PRIVATE
+    Tests/ChannelRecorderTest.cpp
+    Source/ChannelRecorder.h
+    Source/I18n.h
+    Source/RouteGraph.h)
+target_include_directories(ChannelRecorderTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/Source")
+target_compile_options(ChannelRecorderTest PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+target_compile_definitions(ChannelRecorderTest PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_MODAL_LOOPS_PERMITTED=0
+    JUCE_USE_MP3AUDIOFORMAT=0)
+target_link_libraries(ChannelRecorderTest PRIVATE
+    juce::juce_audio_utils
+    juce::juce_recommended_config_flags)
+add_test(NAME ChannelRecorderTest COMMAND ChannelRecorderTest)
+
 # ---- GUI 应用 ----
+if (MICROBRIDGE_BUILD_APP)
 juce_add_gui_app(MicroBridgeApp
     PRODUCT_NAME "MicroBridge"
     COMPANY_NAME "SKCore"
@@ -101,3 +126,4 @@ target_link_libraries(MicroBridgeApp PRIVATE
 if (WIN32)
     target_link_libraries(MicroBridgeApp PRIVATE mfplat mfuuid mfreadwrite)
 endif()
+endif()  # MICROBRIDGE_BUILD_APP

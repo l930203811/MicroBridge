@@ -535,11 +535,17 @@ public:
                 filled (disc);
                 break;
             }
-            case ThemeMoon: // 月牙（点击后进入深色模式）
+            case ThemeMoon: // 月牙（点击后进入深色模式）— 🌙 竖向的实心月牙
             {
+                // 注意：JUCE addCentredArc 角度 0 = 正上方、顺时针递增
+                // （x + r·sinθ, y − r·cosθ），不是数学角 0 = 右侧。
+                // 外圆 R=5，咬合圆圆心左移 2.2 / 半径 4.4，交点在 (cx-2.38, cy±4.40)：
+                //   · 外圆交点角 θ≈-2.6453（左下）/ -0.4963（左上），长弧经左侧到左上交点；
+                //   · 咬合圆交点角 θ≈-0.0414（上）/ 3.1830（下），内弧经咬合圆右侧回左下交点。
+                // 结果：月尖在左上/左下，月背在右侧，整体竖立、开口朝左（与 🌙 emoji 一致）。
                 juce::Path moon;
-                moon.addCentredArc (cx, cy, 5.0f, 5.0f, 0.0f, -1.9f, 1.9f, false);
-                moon.addCentredArc (cx - 1.8f, cy, 4.0f, 4.0f, 0.0f, 1.9f, -1.9f, false);
+                moon.addCentredArc (cx, cy, 5.0f, 5.0f, 0.0f, -2.6453f, -6.7795f, true);
+                moon.addCentredArc (cx - 2.2f, cy, 4.4f, 4.4f, 0.0f, -0.0414f, 3.1830f, false);
                 moon.closeSubPath();
                 filled (moon);
                 break;
@@ -689,19 +695,16 @@ public:
                 stroked (slash);
                 break;
             }
-            case Fold:       // 向下收起（卷起窗口，只留底部控制带）
+            case Fold:       // 双上箭头（卷起窗口，只留底部控制带）
             {
-                // 窗口外框 + 底部加粗条，示意「向下收成一横条」
-                juce::Path box;  box.addRoundedRectangle (cx - 5.5f, cy - 6.0f, 11.0f, 9.0f, 1.5f);
-                stroked (box);
-                g.setColour (c);
-                g.drawLine (cx - 5.0f, cy + 2.6f, cx + 5.0f, cy + 2.6f, 2.0f);
-                // 底部向下小三角
-                juce::Path tri;
-                tri.startNewSubPath (cx - 2.6f, cy + 3.6f);
-                tri.lineTo (cx, cy + 6.2f);
-                tri.lineTo (cx + 2.6f, cy + 3.6f);
-                stroked (tri);
+                // 与「收纳抽屉」的同款双箭头字形（« 旋转 90° 朝上），
+                // 线宽 / 端点样式随 drawIcon 统一，卷起方向朝上示意。
+                juce::Path p;
+                p.startNewSubPath (cx - 4.0f, cy - 0.5f);  p.lineTo (cx, cy - 4.0f);
+                p.lineTo (cx + 4.0f, cy - 0.5f);
+                p.startNewSubPath (cx - 4.0f, cy + 4.5f);  p.lineTo (cx, cy + 1.0f);
+                p.lineTo (cx + 4.0f, cy + 4.5f);
+                stroked (p);
                 break;
             }
         }

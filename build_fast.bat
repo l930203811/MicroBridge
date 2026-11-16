@@ -13,4 +13,4 @@ set "LIB=%MSVC%\lib\x64;%SDK%\Lib\%SDKVER%\ucrt\x64;%SDK%\Lib\%SDKVER%\um\x64"
 set "NINJA=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 set "ROOT=D:\Xiangmu\MicroBridge"
 
-"%NINJA%" -C "%ROOT%\build" MicroBridgeApp RouteGraphTest
+"%NINJA%" -C "%ROOT%\build" MicroBridgeApp RouteGraphTest ChannelRecorderTest

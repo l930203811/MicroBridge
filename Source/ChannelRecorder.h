@@ -10,10 +10,10 @@
 //==============================================================================
 // 通道录音（参考主流机架的通道录制：录音分组 / 目录 / 格式）
 //
-// · 每通道一个 WAV 写出器，音频回调把「效果后、推子后」的通道信号
+// · 每通道一个立体声写出器，音频回调把「效果后、推子后」的 L/R 信号
 //   经 ThreadedWriter 的无锁 FIFO 送后台线程写盘，音频线程零阻塞。
-// · 单声道 24-bit WAV，文件名 = 通道名_时间戳.wav，落在录音目录
-//   （默认 ~/Music/MicroBridge，可在诊断面板里更换）。
+// · 支持 WAV / FLAC / AIFF、16 / 24 bit，文件名 = 通道名_时间戳.扩展名，
+//   落在录音目录（默认 ~/Music/MicroBridge，可在诊断面板里更换）。
 // · stop 在消息线程等待超过两个最大块周期后再析构写出器，
 //   保证音频线程不再持有指针。
 //==============================================================================
@@ -80,6 +80,32 @@ namespace mb
             int n = 0;
             for (const auto& s : slots_) if (s.active.load()) ++n;
             return n;
+        }
+
+        /** 音频线程共用：复制一路推子后立体声信号到分轨暂存。 */
+        static void copyForRecording (const float* srcL, const float* srcR,
+                                      float* dstL, float* dstR, float gain, int n) noexcept
+        {
+            if (srcL == nullptr || srcR == nullptr || dstL == nullptr || dstR == nullptr || n <= 0)
+                return;
+            for (int i = 0; i < n; ++i)
+            {
+                dstL[i] = srcL[i] * gain;
+                dstR[i] = srcR[i] * gain;
+            }
+        }
+
+        /** 音频线程共用：把一路推子后立体声信号累加到 Sum 混音。 */
+        static void addForRecording (const float* srcL, const float* srcR,
+                                     float* dstL, float* dstR, float gain, int n) noexcept
+        {
+            if (srcL == nullptr || srcR == nullptr || dstL == nullptr || dstR == nullptr || n <= 0)
+                return;
+            for (int i = 0; i < n; ++i)
+            {
+                dstL[i] += srcL[i] * gain;
+                dstR[i] += srcR[i] * gain;
+            }
         }
 
         /** 消息线程：布防一个通道。Sum 模式只建一次共享写出器；MultiTrack 每通道一个文件。 */
@@ -172,27 +198,27 @@ namespace mb
                     stop (i);
         }
 
-        /** 音频线程：推一个通道的样本块（已含推子增益），FIFO 满则丢弃。 */
-        void push (int ch, const float* data, int n) noexcept
+        /** 音频线程：推一个通道的立体声样本块（已含推子增益），FIFO 满则丢弃。 */
+        void push (int ch, const float* left, const float* right, int n) noexcept
         {
             if (paused_.load (std::memory_order_relaxed)) return;
-            if (ch < 0 || ch >= kMaxChannels || data == nullptr) return;
+            if (ch < 0 || ch >= kMaxChannels || left == nullptr || right == nullptr) return;
             const auto& slot = slots_[static_cast<size_t> (ch)];
             if (! slot.active.load (std::memory_order_relaxed)) return;
 
             auto* w = slot.writer.load (std::memory_order_acquire);
             if (w == nullptr) return;
-            const float* ptrs[1] = { data };
+            const float* ptrs[2] = { left, right };
             w->write (ptrs, static_cast<int> (n));
         }
 
-        /** 音频线程：推合成模式的混合信号（所有布防通道已相加），FIFO 满则丢弃。 */
-        void pushSum (const float* data, int n) noexcept
+        /** 音频线程：推合成模式的立体声混合信号，FIFO 满则丢弃。 */
+        void pushSum (const float* left, const float* right, int n) noexcept
         {
             if (paused_.load (std::memory_order_relaxed)) return;
             auto* w = sumWriter_.load (std::memory_order_acquire);
-            if (w == nullptr || data == nullptr) return;
-            const float* ptrs[1] = { data };
+            if (w == nullptr || left == nullptr || right == nullptr) return;
+            const float* ptrs[2] = { left, right };
             w->write (ptrs, static_cast<int> (n));
         }
 
@@ -220,12 +246,12 @@ namespace mb
             const auto e = file.getFileExtension().toLowerCase();
             if (e == ".flac")
                 return std::unique_ptr<juce::AudioFormatWriter> (
-                    juce::FlacAudioFormat().createWriterFor (stream.release(), sr, 1, bits, {}, 0));
+                    juce::FlacAudioFormat().createWriterFor (stream.release(), sr, 2, bits, {}, 0));
             if (e == ".aiff" || e == ".aif")
                 return std::unique_ptr<juce::AudioFormatWriter> (
-                    juce::AiffAudioFormat().createWriterFor (stream.release(), sr, 1, bits, {}, 0));
+                    juce::AiffAudioFormat().createWriterFor (stream.release(), sr, 2, bits, {}, 0));
             return std::unique_ptr<juce::AudioFormatWriter> (
-                juce::WavAudioFormat().createWriterFor (stream.release(), sr, 1, bits, {}, 0));
+                juce::WavAudioFormat().createWriterFor (stream.release(), sr, 2, bits, {}, 0));
         }
 
         static juce::String sanitise (juce::String s)

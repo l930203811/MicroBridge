@@ -922,7 +922,8 @@ namespace mb
             channels_.assign (static_cast<size_t> (chans) * 2, std::vector<float> (kMaxBlock, 0.0f));
             inScratch_.assign (static_cast<size_t> (inPorts), std::vector<float> (kMaxBlock, 0.0f));
             outScratch_.assign(static_cast<size_t> (outPorts), std::vector<float> (kMaxBlock, 0.0f));
-            recMix_.assign (static_cast<size_t> (kMaxBlock), 0.0f);
+            for (auto& side : recMix_)
+                side.assign (static_cast<size_t> (kMaxBlock), 0.0f);
             auxIn_.assign (juce::jmax<size_t> (1, auxDevices_.size()), {});
             for (size_t s = 0; s < auxIn_.size(); ++s)
             {
@@ -948,8 +949,10 @@ namespace mb
                     duckGain_.fill (1.0f);
                     fxPreparedSr_ = sr;
                     recorder_.setSampleRate (sr);
-                    recScratch_.assign (static_cast<size_t> (kMaxChannels),
-                                        std::vector<float> (kMaxBlock, 0.0f));
+                    recScratch_.resize (static_cast<size_t> (kMaxChannels));
+                    for (auto& scratch : recScratch_)
+                        for (auto& side : scratch)
+                            side.assign (static_cast<size_t> (kMaxBlock), 0.0f);
                 }
                 // 插件按「真实」采样率与块大小 prepare（内部按参数去重）。
                 // 旧版固定传 kMaxBlock=8192，而 processBlock 实际只有 256~512
@@ -1155,7 +1158,8 @@ namespace mb
             const bool sumMode = recActive && recorder_.mode() == mb::ChannelRecorder::Mode::Sum;
             float peak = 0.0f;
             if (sumMode)
-                juce::FloatVectorOperations::clear (recMix_.data(), n);
+                for (auto& side : recMix_)
+                    juce::FloatVectorOperations::clear (side.data(), n);
             for (int c = 0; c < nCh; ++c)
             {
                 float* bL = channels_[static_cast<size_t> (2 * c)].data();
@@ -1187,17 +1191,19 @@ namespace mb
                     const float g = f;                         // = 推子增益（已含 active 判定）
                     if (sumMode)
                     {
-                        for (int i = 0; i < n; ++i) recMix_[i] += bL[i] * g;
+                        mb::ChannelRecorder::addForRecording
+                            (bL, bR, recMix_[0].data(), recMix_[1].data(), g, n);
                     }
                     else
                     {
                         auto& scratch = recScratch_[static_cast<size_t> (c)];
-                        for (int i = 0; i < n; ++i) scratch[i] = bL[i] * g;
-                        recorder_.push (c, scratch.data(), n);
+                        mb::ChannelRecorder::copyForRecording
+                            (bL, bR, scratch[0].data(), scratch[1].data(), g, n);
+                        recorder_.push (c, scratch[0].data(), scratch[1].data(), n);
                     }
                 }
             }
-            if (sumMode) recorder_.pushSum (recMix_.data(), n);
+            if (sumMode) recorder_.pushSum (recMix_[0].data(), recMix_[1].data(), n);
             inputPeak_.store (peak, std::memory_order_relaxed);
         }
 
@@ -1460,8 +1466,8 @@ namespace mb
         mb::PluginCatalog pluginCatalog_;
         mb::ChannelPluginBank pluginBank_;
         mb::MediaPlayerBank mediaPlayers_;       // 「音频播放」自带插件
-        std::vector<std::vector<float>> recScratch_;
-        std::vector<float> recMix_;                  // 合成模式：布防通道相加
+        std::vector<std::array<std::vector<float>, 2>> recScratch_;
+        std::array<std::vector<float>, 2> recMix_;       // 合成模式：布防通道 L/R 分别相加
         double fxPreparedSr_ = 0.0;
 
         // 音频线程亲和性（Windows）

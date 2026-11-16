@@ -16,4 +16,4 @@ set "ROOT=D:\Xiangmu\MicroBridge"
 "%CMAKE%" -G Ninja -B "%ROOT%\build" -S "%ROOT%" -DCMAKE_BUILD_TYPE=Release %*
 if errorlevel 1 exit /b 1
 
-"%CMAKE%" --build "%ROOT%\build" --config Release --target MicroBridgeApp RouteGraphTest %*
+"%CMAKE%" --build "%ROOT%\build" --config Release --target MicroBridgeApp RouteGraphTest ChannelRecorderTest %*
