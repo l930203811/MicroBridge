@@ -69,6 +69,13 @@ namespace mb
     /** 应用名：中文界面只显示「微音桥」，英文界面只显示 MicroBridge。 */
     inline juce::String appName() { return tr ("微音桥", "MicroBridge"); }
 
+    /** 应用版本：安装包脚本（installer/MicroBridge.iss）/ 关于页 / 元数据共用，
+        发版时三处同步改这一处（脚本侧另有 #define，改动时顺手对照）。 */
+    inline constexpr const char* kAppVersion = "0.1.0";
+
+    /** GitHub 仓库地址：关于页展示 + 打开浏览器 / 复制链接共用。 */
+    inline constexpr const char* kRepoUrl = "https://github.com/l930203811/MicroBridge";
+
     struct NamedItem { const char* zh; const char* en; };
 
     inline constexpr int kMaxNamedChannels = 12;

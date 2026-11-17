@@ -7,4 +7,5 @@ build/
 .DS_Store
 desktop.ini
 ThirdParty/
+installer/Output/
 .workbuddy/

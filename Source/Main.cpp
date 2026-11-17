@@ -23,7 +23,7 @@ class MicroBridgeApplication : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "MicroBridge"; }
-    const juce::String getApplicationVersion() override { return "0.1.0"; }
+    const juce::String getApplicationVersion() override { return mb::kAppVersion; }
     // 允许多实例并行：JUCE 的单实例检测会在已有实例（哪怕只是崩溃残留的进程壳）
     // 存在时让新进程静默退出、连窗口都不创建，排查成本高且调音台本就有多开需求。
     bool moreThanOneInstanceAllowed() override { return true; }
@@ -44,6 +44,9 @@ public:
         juce::Desktop::getInstance().setGlobalScaleFactor (bootSettings.uiScale);
         // 主题在任何组件构造/绘制之前定死，浅色模式不在启动时闪深色
         mb::ui::applyTheme (! bootSettings.lightTheme);
+        // LnF 在上面 setDefaultLookAndFeel 构造时已缓存 PopupMenu 颜色（那时 mb::ui 仍是默认深色）。
+        // applyTheme 翻转后必须重刷，否则「启动时即为浅色主题」的菜单背景会停留在深色（近黑）。
+        mb::sharedLookAndFeel().refreshThemeColours();
         mb::setLanguageMode (bootSettings.languageMode);
 
         // 「重启微音桥」：新进程先等旧进程释放音频设备（约 1.4 s），

@@ -2,6 +2,7 @@
 
 #include <JuceHeader.h>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@
 
 #include "AppSettings.h"
 #include "AudioEngine.h"
+#include "BuiltinDefaultPreset.h"
 #include "ChannelLinkOverlay.h"
 #include "ChannelLinks.h"
 #include "ChannelStrip.h"
@@ -29,6 +31,7 @@
 #include "SourcePicker.h"
 #include "Theme.h"
 #include "WelcomeOverlay.h"
+#include "PresetSwitcherOverlay.h"
 
 //==============================================================================
 // 通道条容器
@@ -429,7 +432,7 @@ class DrawerButton : public juce::TextButton
 public:
     enum Icon { Add, NewDoc, Save, Import, Export, Clear, Settings,
                 Nodes, Mixer, Collapse, Expand, ThemeSun, ThemeMoon,
-                RecShow, RecHide, Fold };
+                RecShow, RecHide, Fold, Swap };
 
     Icon icon = Add;
     bool iconOnly = false;
@@ -573,6 +576,19 @@ public:
                 fold.lineTo (cx + 1.5f, cy - 3.0f);
                 fold.lineTo (cx + 4.5f, cy - 3.0f);
                 stroked (fold);
+                break;
+            }
+            case Swap:      // 双向箭头（切换预设）
+            {
+                juce::Path p;
+                // 上箭头 → 右；下箭头 → 左（往返切换语义）
+                p.startNewSubPath (cx - 5.0f, cy - 3.0f);  p.lineTo (cx + 4.2f, cy - 3.0f);
+                p.startNewSubPath (cx + 1.6f, cy - 5.6f);  p.lineTo (cx + 4.2f, cy - 3.0f);
+                p.startNewSubPath (cx + 1.6f, cy - 0.4f);  p.lineTo (cx + 4.2f, cy - 3.0f);
+                p.startNewSubPath (cx + 5.0f, cy + 3.0f);  p.lineTo (cx - 4.2f, cy + 3.0f);
+                p.startNewSubPath (cx - 1.6f, cy + 0.4f);  p.lineTo (cx - 4.2f, cy + 3.0f);
+                p.startNewSubPath (cx - 1.6f, cy + 5.6f);  p.lineTo (cx - 4.2f, cy + 3.0f);
+                stroked (p);
                 break;
             }
             case Save:      // 软盘
@@ -752,9 +768,8 @@ public:
         stripContainer_.addChildComponent (dragOverlay_);
 
         setupButton (addBtn_,        DrawerButton::Add,      mb::tr ("添加通道", "Add"),    [this] { addChannel(); });
-        setupButton (newBtn_,        DrawerButton::NewDoc,   mb::tr ("新建预设", "New"),    [this] { newPreset(); });
+        setupButton (newBtn_,        DrawerButton::Swap,     mb::tr ("切换预设", "Presets"), [this] { showPresetSwitcher(); });
         setupButton (savePresetBtn_, DrawerButton::Save,     mb::tr ("保存预设", "Save"),   [this] { saveCurrentPreset(); });
-        setupButton (importBtn_,     DrawerButton::Import,   mb::tr ("导入预设", "Import"), [this] { importPreset(); });
         setupButton (exportBtn_,     DrawerButton::Export,   mb::tr ("导出预设", "Export"), [this] { exportPreset(); });
         setupButton (clearBtn_,      DrawerButton::Clear,    mb::tr ("清除连接", "Clear"),  [this] { confirmClearRoutes(); });
         setupButton (settingsBtn_,   DrawerButton::Settings, mb::tr ("设置", "Settings"),   [this] { showSettings(); });
@@ -789,6 +804,13 @@ public:
         nodeViewport_.setScrollBarsShown (true, true);
         nodeViewport_.setVisible (false);
         addAndMakeVisible (nodeViewport_);
+        // 顶部固定工具栏：浮在视口之上，不随画布滚动
+        nodeToolbar_.setVisible (false);
+        addAndMakeVisible (nodeToolbar_);
+        nodeToolbar_.getSnap       = [this] { return nodeCanvas_.isSnapOn(); };
+        nodeToolbar_.onToggleSnap  = [this] { nodeCanvas_.toggleSnap(); };
+        nodeToolbar_.onResetLayout = [this] { nodeCanvas_.resetNodeLayout(); };
+        nodeCanvas_.onSnapChanged  = [this] { nodeToolbar_.repaint(); };
         nodeCanvas_.onMessage = [this] (const juce::String& m) { setMessage (m); };
         nodeCanvas_.onChanged = [this]
         {
@@ -797,9 +819,72 @@ public:
             updateSummary();
         };
         nodeCanvas_.onAddPlugin    = [this] (int ch)          { showPluginPicker (ch); };
-        nodeCanvas_.onOpenPlugin   = [this] (int ch, int idx) { openPluginEditor (ch, idx); };
+        nodeCanvas_.onAddFreePlugins = [this] (const juce::Point<float>& p) { showFreePluginPicker (p); };
+        nodeCanvas_.onOpenPlugin   = [this] (int ch, int idx) { openPluginUi (ch, idx); };
         nodeCanvas_.onRemovePlugin = [this] (int ch, int idx) { removePluginAt (ch, idx); };
         nodeCanvas_.onOpenSource   = [this] (int ch, bool input) { showSourcePicker (ch, input); };
+        nodeCanvas_.onAddChannel   = [this]                    { addChannel(); };
+        nodeCanvas_.onDeleteChannel= [this] (int ch)           { deleteChannel (ch); };
+        nodeCanvas_.onMovePlugin   = [this] (int s, int i, int d, int t) { movePluginAt (s, i, d, t); };
+        nodeCanvas_.onRenamePlugin = [this] (int ch, int idx, const juce::String& name)
+        {
+            const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+            engine_.pluginBank().setPluginNote (bc, idx, name);
+            setMessage (mb::tr ("已重命名插件", "Plugin renamed"));
+            dirty_ = true;
+            refreshStripsFromGraph();
+            nodeCanvas_.repaint();
+        };
+        // 节点视图右键菜单对齐经典视图：直接复用同一批处理函数
+        nodeCanvas_.onDuplicateChannel  = [this] (int ch) { duplicateChannel (ch); };
+        nodeCanvas_.onSetRightAligned   = [this] (int ch, bool on) { applyRightAligned (ch, on); };
+        nodeCanvas_.onLinkChannel       = [this] (int ch) { showChannelLinkDialog (ch, -1); };
+        nodeCanvas_.onPickColour        = [this] (int ch) { showColourPicker (ch); };
+        nodeCanvas_.onSetHidden         = [this] (int ch, bool hidden) { setChannelHidden (ch, hidden); };
+        nodeCanvas_.onShowAllChannels   = [this] { showAllChannels(); };
+        nodeCanvas_.onPluginBypass      = [this] (int ch, int idx)
+        {
+            const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+            auto& bank = engine_.pluginBank();
+            const bool bypass = ! bank.pluginBypass (bc, idx);
+            bank.setBypass (bc, idx, bypass);
+            const int bid = bank.pluginBuiltInId (bc, idx);
+            if (bid > 0 && ch >= 0)
+            {
+                auto params = engine_.fxParams (ch);
+                mb::applyBuiltInToParams (params, bid, ! bypass);
+                engine_.setFxParams (ch, params);
+            }
+            setMessage ((bypass ? mb::tr ("已旁通插件：", "Plugin bypassed: ")
+                                : mb::tr ("已启用插件：", "Plugin enabled: "))
+                        + bank.pluginName (bc, idx));
+            dirty_ = true;
+            nodeCanvas_.repaint();
+        };
+        nodeCanvas_.onPluginOffline     = [this] (int ch, int idx)
+        {
+            const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+            auto& bank = engine_.pluginBank();
+            if (bank.pluginOffline (bc, idx))
+            {
+                const auto desc = engine_.pluginCatalog().findByIdentifier (
+                    bank.pluginIdentifier (bc, idx));
+                juce::String err;
+                auto inst = engine_.pluginCatalog().create (
+                    desc, err, engine_.sampleRate(), engine_.bufferSizeSamples());
+                if (inst != nullptr)
+                    bank.restoreOffline (bc, idx, std::move (inst),
+                                         engine_.sampleRate(), engine_.bufferSizeSamples());
+            }
+            else
+            {
+                closePluginEditor (bc, idx);
+                bank.markOffline (bc, idx);
+            }
+            dirty_ = true;
+            nodeCanvas_.repaint();
+        };
+        nodeCanvas_.onPluginLink        = [this] (int ch, int action) { showChannelLinkDialog (ch, action); };
         applyDrawerState (settings_.drawerCollapsed);   // 恢复抽屉收纳状态（先于窗口定宽）
         applyViewMode (settings_.nodeView);
 
@@ -984,6 +1069,7 @@ public:
         viewport_.setVisible (! nodeView);
         recorderBar_.setVisible (! nodeView);
         nodeViewport_.setVisible (nodeView);
+        nodeToolbar_.setVisible (nodeView && ! folded_);
         if (nodeView) nodeCanvas_.updateSize();
 
         // 文案随视图切换（节点视图 ↔ 经典视图），不做高亮填充，保持键帽观感统一
@@ -1105,7 +1191,6 @@ public:
         addBtn_.setBounds        (5, by, bw, 30); by += 34;
         newBtn_.setBounds        (5, by, bw, 30); by += 34;
         savePresetBtn_.setBounds (5, by, bw, 30); by += 34;
-        importBtn_.setBounds     (5, by, bw, 30); by += 34;
         exportBtn_.setBounds     (5, by, bw, 30); by += 34;
         clearBtn_.setBounds      (5, by, bw, 30); by += 34;
         settingsBtn_.setBounds   (5, getHeight() - 40, bw, 30);
@@ -1116,7 +1201,7 @@ public:
         themeBtn_.setBounds      (5, getHeight() - 210, bw, 30);
 
         // 折叠时抽屉整体隐藏（展开入口改为标题栏下拉箭头），展开时恢复
-        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &importBtn_, &exportBtn_,
+        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &exportBtn_,
                          &clearBtn_, &settingsBtn_, &toggleBtn_, &viewBtn_,
                          &themeBtn_, &recBtn_, &foldBtn_ })
             b->setVisible (! folded_);
@@ -1127,6 +1212,7 @@ public:
             // 通道底部 M/S/R/喇叭 + 名称带（高度见 foldedContentHeight）。
             recorderBar_.setVisible (false);
             nodeViewport_.setBounds (0, 0, 0, 0);
+            nodeToolbar_.setVisible (false);
             viewport_.setBounds (0, 0, w, getHeight());
             layoutStrips();
             // 通道条高于视口，把底部控制带滚入可视区
@@ -1140,12 +1226,16 @@ public:
             recorderBar_.setVisible (false);
             viewport_.setBounds (0, 0, 0, 0);
             nodeViewport_.setBounds (drawerW, 0, w - drawerW, getHeight());
+            // 固定工具栏覆盖在视口顶端（26px），不随下方画布滚动
+            nodeToolbar_.setVisible (true);
+            nodeToolbar_.setBounds (drawerW, 0, w - drawerW, 26);
             // 窗口宽度随通道数自动变化：让三列按主区宽度重排，输出列右侧不再留大片空白
             nodeCanvas_.setAvailableWidth (w - drawerW);
         }
         else
         {
             nodeViewport_.setBounds (0, 0, 0, 0);
+            nodeToolbar_.setVisible (false);
             if (recorderVisible_)
             {
                 // 录音机：通道区顶部横条，横跨主区宽度
@@ -1251,9 +1341,8 @@ private:
             b.setTooltip (t);
         };
         set (addBtn_,        mb::tr ("添加通道", "Add"));
-        set (newBtn_,        mb::tr ("新建预设", "New"));
+        set (newBtn_,        mb::tr ("切换预设", "Presets"));
         set (savePresetBtn_, mb::tr ("保存预设", "Save"));
-        set (importBtn_,     mb::tr ("导入预设", "Import"));
         set (exportBtn_,     mb::tr ("导出预设", "Export"));
         set (clearBtn_,      mb::tr ("清除连接", "Clear"));
         set (settingsBtn_,   mb::tr ("设置", "Settings"));
@@ -1323,7 +1412,7 @@ private:
         drawerW_ = drawerCollapsed_ ? 44 : mb::ui::kDrawerWidth;
         toggleBtn_.icon = drawerCollapsed_ ? DrawerButton::Expand : DrawerButton::Collapse;
         toggleBtn_.iconOnly = drawerCollapsed_;   // 44px 窄抽屉只显示图标，避免文字溢出
-        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &importBtn_, &exportBtn_,
+        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &exportBtn_,
                          &clearBtn_, &settingsBtn_, &viewBtn_, &themeBtn_, &recBtn_,
                          &foldBtn_ })
             b->iconOnly = drawerCollapsed_;
@@ -1451,7 +1540,8 @@ private:
             graph_.resize (9, inputs, outputs);
             syncChannelNames();
             syncAlignmentVector();
-            if (! strips_.empty()) rebuildStrips();
+            rebuildStrips();     // 无条件重建：从 0 通道空白预设载入时 strips_ 为空，
+                                 // 旧条件 !empty() 会跳过重建导致调音台无通道显示
         }
         else
         {
@@ -1483,6 +1573,51 @@ private:
         graph_.setPortPairs (rawIn, rawOut);
 
         // 四个独立输入源：按设备名找，找不到宁可留空也不乱接（避免杂音）。
+        // 顺序：先选输出，再选输入 —— 便于做数字回环防护（见下）。
+        const auto monitor = pickPortPair (outPairs, usedOut, false,
+            { "扬声器", "Speaker", "Headphone", "耳机", "Wuying" }, false);
+        const auto live = pickPortPair (outPairs, usedOut, false,
+            { "Voicemeeter Input", "CABLE Input", "B2", "Stream", "OBS", "直播", "Virtual" }, false);
+        const auto voice = pickPortPair (outPairs, usedOut, false,
+            { "Voicemeeter", "B1", "CABLE", "语音", "Chat", "Voice", "Discord" }, true);
+
+        // 数字回环防护：VB-Cable / Voicemeeter VAIO 这类虚拟设备同时提供
+        // 「X Input」（输出端）与「X Output」（输入端），是同一条回环链路。
+        // 若把总线输出接到 X Input、又把 X Output 当输入喂回通道，
+        // 直播总线会自激（叠加多路并联环路总增益超 1，声音无限放大）。
+        // 把所有与已选输出构成回环对的输入标记为已占用，输入选择自然跳过。
+        auto loopKey = [] (juce::String n)
+        {
+            n = n.toLowerCase()
+                 .retainCharacters ("abcdefghijklmnopqrstuvwxyz0123456789");
+            // VB-Cable 风格：A1 Input / B1 Output —— A=送入侧、B=回程侧，
+            // 编号相同即同一条线。剥掉 A/B 侧前缀只比「编号 + 设备名」，
+            // 否则 a1vbcable1 != b1vbcable1 会漏判（实测正是漏判点）。
+            if (n.length() >= 2 && (n[0] == 'a' || n[0] == 'b')
+                && n[1] >= '0' && n[1] <= '9')
+                n = n.substring (1);
+            return n;
+        };
+        auto isLoopback = [&loopKey] (const juce::String& inName, const juce::String& outName)
+        {
+            // 回环对形态：输出端名带 "Input"、输入端名带 "Output"、
+            // 去掉角色词与 A/B 侧前缀后主名相同（A1↔B1 / CABLE↔CABLE / VAIO↔VAIO）
+            if (! outName.containsIgnoreCase ("input") || ! inName.containsIgnoreCase ("output"))
+                return false;
+            const auto a = loopKey (inName.replace ("output", "", true));
+            const auto b = loopKey (outName.replace ("input", "", true));
+            return a.isNotEmpty() && a == b;
+        };
+        for (const auto* op : { &monitor, &live, &voice })
+        {
+            if (! op->valid()) continue;
+            const auto oname = engine_.catalog().outputPorts()[static_cast<size_t> (op->l)].deviceName;
+            for (const auto& ip : inPairs)
+                if (! usedIn[static_cast<size_t> (ip.pair)]
+                    && isLoopback (engine_.catalog().inputPorts()[static_cast<size_t> (ip.l)].deviceName, oname))
+                    usedIn[static_cast<size_t> (ip.pair)] = true;
+        }
+
         const auto game = pickPortPair (inPairs, usedIn, true,
             { "B1 Output", "Voicemeeter", "游戏", "Game", "系统", "System" }, false);
         const auto mic = pickPortPair (inPairs, usedIn, true,
@@ -1491,14 +1626,6 @@ private:
             { "B2", "A2", "Discord", "队友", "聊天", "Chat", "Voice", "CABLE Output" }, true);
         const auto music = pickPortPair (inPairs, usedIn, true,
             { "CABLE", "伴奏", "音乐", "Music", "Backing", "媒体" }, true);
-
-        // 输出：先锁定耳机/扬声器做监听，再给直播与语音软件分配独立设备。
-        const auto monitor = pickPortPair (outPairs, usedOut, false,
-            { "扬声器", "Speaker", "Headphone", "耳机", "Wuying" }, false);
-        const auto live = pickPortPair (outPairs, usedOut, false,
-            { "Voicemeeter Input", "CABLE Input", "B2", "Stream", "OBS", "直播", "Virtual" }, false);
-        const auto voice = pickPortPair (outPairs, usedOut, false,
-            { "Voicemeeter", "B1", "CABLE", "语音", "Chat", "Voice", "Discord" }, true);
 
         std::string why;
         auto feed = [&] (int ch, const PortPair& p, float gain)
@@ -1592,18 +1719,7 @@ private:
                 updateSummary();
             };
             s->onShowFx = [this] (int ch) { showFx (ch); };
-            s->onOpenPlugin = [this] (int ch, int idx)
-            {
-                // 自带插件 → 打开该效果自己的面板（音频播放 → 播放器面板）；
-                // 第三方 → 打开插件编辑器窗口
-                if (const auto bid = engine_.pluginBank().pluginBuiltInId (ch, idx); bid > 0)
-                {
-                    if (bid == 9) { showMediaPlayer (ch); return; }
-                    showFx (ch, bid);
-                    return;
-                }
-                openPluginEditor (ch, idx);
-            };
+            s->onOpenPlugin = [this] (int ch, int idx) { openPluginUi (ch, idx); };
             s->onPluginOffline = [this] (int ch, int idx)
             {
                 // 离线前钩子：实例即将退役，编辑器窗口持有裸指针必须先关
@@ -2586,7 +2702,8 @@ private:
             mb::AppSettings::save (settings_);
             closeWelcome();
             applyLanguage();                  // 全部文案按新语言重建
-            showSetup (true, engine_.error());
+            presetAfterSetup_ = true;         // 设备设置结束（应用或取消）后弹预设选择
+            showSetup (true, engine_.error()); // 首启：选完语言 → 设备设置 → 选/新建预设
         };
         addAndMakeVisible (welcome_.get());
         welcome_->setBounds (getLocalBounds());
@@ -2674,7 +2791,7 @@ private:
     /** 主题切换后重刷常驻按钮的构造期颜色（通道条由 rebuildStrips 重建）。 */
     void refreshChromeColours()
     {
-        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &importBtn_, &exportBtn_,
+        for (auto* b : { &addBtn_, &newBtn_, &savePresetBtn_, &exportBtn_,
                          &clearBtn_, &settingsBtn_, &toggleBtn_, &themeBtn_, &recBtn_,
                          &viewBtn_, &foldBtn_ })
         {
@@ -3150,15 +3267,19 @@ private:
         （自带插件联动参数/媒体播放器清理 + 关编辑器 + 刷新通道条）。 */
     void removePluginAt (int ch, int idx)
     {
+        // 节点视图自由停放插件以 ch=-1 传入（引擎侧存在 kFreePluginSlot）
+        if (ch < 0) ch = mb::ChannelPluginBank::kFreePluginSlot;
         auto& bank = engine_.pluginBank();
         if (idx < 0 || idx >= bank.pluginCount (ch)) return;
         const int builtIn = bank.pluginBuiltInId (ch, idx);
-        if (builtIn == 9)
+        constexpr int fs = mb::ChannelPluginBank::kFreePluginSlot;
+        const bool real = ch != fs;
+        if (real && builtIn == 9)
         {
             destroyMediaPlayer();
             engine_.mediaPlayers().clearPlayer (ch);
         }
-        else if (builtIn > 0)
+        else if (real && builtIn > 0)
         {
             auto params = engine_.fxParams (ch);
             mb::applyBuiltInToParams (params, builtIn, false);
@@ -3168,6 +3289,74 @@ private:
         closePluginEditor (ch, idx);
         bank.removePlugin (ch, idx);
         refreshStripsFromGraph();
+        updateSummary();
+        dirty_ = true;
+        nodeCanvas_.repaint();
+    }
+
+    /** 节点视图：插件移动 / 连接 / 断开 / 同链重排的统一收尾。
+        src / dst 均可为 kFreePluginSlot（未连接区）；targetIdx >= 0 表示插到该序号之前。 */
+    void movePluginAt (int src, int idx, int dst, int targetIdx = -1)
+    {
+        auto& bank = engine_.pluginBank();
+        constexpr int fs = mb::ChannelPluginBank::kFreePluginSlot;
+        if (src < 0 || dst < 0 || idx < 0 || idx >= bank.pluginCount (src)) return;
+
+        // 同一条链内重排：无实例搬移，仅调整数组顺序
+        if (src == dst)
+        {
+            closePluginEditor (src, idx);
+            if (targetIdx < 0 || targetIdx >= bank.pluginCount (src)) return;
+            if (! bank.reorderPlugin (src, idx, targetIdx)) return;
+            if (src != fs) syncStripAfterPluginChange (src);
+            updateSummary();
+            dirty_ = true;
+            nodeCanvas_.repaint();
+            return;
+        }
+
+        const bool srcReal = src != fs, dstReal = dst != fs;
+        const int builtIn = bank.pluginBuiltInId (src, idx);
+        // 先关源插件的编辑器（实例即将换槽，窗口持有裸指针）
+        closePluginEditor (src, idx);
+
+        // 源槽收尾：仅真实通道需要关内置效果 / 播放器
+        if (srcReal && builtIn == 9)
+        {
+            destroyMediaPlayer();
+            engine_.mediaPlayers().clearPlayer (src);
+        }
+        else if (srcReal && builtIn > 0)
+        {
+            auto params = engine_.fxParams (src);
+            mb::applyBuiltInToParams (params, builtIn, false);
+            engine_.setFxParams (src, params);
+            closeFxPanel();
+        }
+
+        // 实际搬移 PluginEntry（含实例 / 备注 / 旁通状态）
+        int newIdx = bank.movePlugin (src, idx, dst);
+        if (newIdx < 0) return;
+        if (targetIdx >= 0 && targetIdx != newIdx)
+        {
+            bank.reorderPlugin (dst, newIdx, targetIdx);
+            newIdx = juce::jmin (targetIdx, bank.pluginCount (dst) - 1);
+        }
+
+        // 目标槽开启对应内置效果；停放槽只保留条目，不出声
+        if (dstReal && builtIn == 9)
+        {
+            engine_.mediaPlayers().ensurePlayer (dst);
+        }
+        else if (dstReal && builtIn > 0)
+        {
+            auto params = engine_.fxParams (dst);
+            mb::applyBuiltInToParams (params, builtIn, true);
+            engine_.setFxParams (dst, params);
+        }
+
+        if (srcReal) syncStripAfterPluginChange (src);
+        if (dstReal) syncStripAfterPluginChange (dst);
         updateSummary();
         dirty_ = true;
         nodeCanvas_.repaint();
@@ -3187,6 +3376,63 @@ private:
         pluginPicker_->setBounds (getLocalBounds());
         pluginPicker_->toFront (true);
         pluginPicker_->grabKeyboardFocus();
+    }
+
+    /** 节点视图空白区右键「+插件」：多选浮层，确定后按勾选顺序落在右键光标处。 */
+    void showFreePluginPicker (const juce::Point<float>& canvasPos)
+    {
+        closePluginPicker();
+        pluginPicker_ = std::make_unique<PluginPickerOverlay> (engine_, -1, true);
+        pluginPicker_->onMultiConfirm = [this, canvasPos] (const std::vector<int>& ids)
+            { addFreePluginsAt (canvasPos, ids); };
+        pluginPicker_->onClose = [this] { closePluginPicker(); };
+        addAndMakeVisible (pluginPicker_.get());
+        pluginPicker_->setBounds (getLocalBounds());
+        pluginPicker_->toFront (true);
+        pluginPicker_->grabKeyboardFocus();
+    }
+
+    /** 真正创建自由插件（不接任何通道，不碰 FxParams）：
+        内置插件只加条目，第三方按标识创建实例；位置交给 nodeCanvas 按 UID 记住。 */
+    void addFreePluginsAt (const juce::Point<float>& pos, const std::vector<int>& ids)
+    {
+        auto& bank = engine_.pluginBank();
+        constexpr int fs = mb::ChannelPluginBank::kFreePluginSlot;
+        const double sr = engine_.sampleRate() > 8000.0 ? engine_.sampleRate() : 48000.0;
+        const int bs = engine_.bufferSizeSamples() > 0 ? engine_.bufferSizeSamples() : 512;
+
+        int added = 0;
+        for (int id : ids)
+        {
+            if (id >= 1 && id <= mb::kBuiltInPluginCount)
+            {
+                bank.addBuiltIn (fs, id);
+            }
+            else if (id >= 1000 && id - 1000 < engine_.pluginCatalog().count())
+            {
+                const auto desc = engine_.pluginCatalog().get (id - 1000);
+                juce::String err;
+                auto inst = engine_.pluginCatalog().create (desc, err, sr, bs);
+                if (inst == nullptr) continue;
+                bank.addPlugin (fs, std::move (inst), sr, bs, nullptr, desc.fileOrIdentifier);
+            }
+            else continue;
+
+            const int last = bank.pluginCount (fs) - 1;
+            // 多张卡片沿右键点向右下错开，保证每张都可点可拖
+            nodeCanvas_.setPluginPosition (bank.pluginUid (fs, last),
+                { pos.x + static_cast<float> (added * 24),
+                  pos.y + static_cast<float> (added * 20) });
+            ++added;
+        }
+        if (added > 0)
+        {
+            setMessage (juce::String (added) + mb::tr (" 个插件已添加到画布（拖动端口连接通道）",
+                                                      " plugin(s) added to canvas (drag ports to connect)"));
+            dirty_ = true;
+            nodeCanvas_.updateSize();
+            nodeCanvas_.repaint();
+        }
     }
 
     /** 浮层点击 = 切换：已添加（按内置 id / 插件标识匹配）→ 移除首个实例；
@@ -3402,11 +3648,174 @@ private:
         removeChildComponent (setup_.get());
         setup_.reset();
         updateSummary();
+        // 首启链尾：设备设置结束（应用或取消）→ 选默认预设 / 新建预设。
+        // 设备已配置好，内置预设的连线可按真实端口一次建立。
+        if (presetAfterSetup_)
+        {
+            presetAfterSetup_ = false;
+            showPresetSwitcher (true);
+        }
     }
 
     //==========================================================================
     // 新建预设：有未保存改动时先询问（保存 / 不保存 / 取消），否则直接继续。
     // 确认后清空为 0 通道空白预设：断开全部连接、退役全部插件、复位内置效果。
+    //==========================================================================
+    // 预设切换浮层（抽屉「切换预设」/ 首次启动选预设共用）
+    //==========================================================================
+    void showPresetSwitcher (bool firstRun = false)
+    {
+        if (presetSwitcher_ != nullptr) closePresetSwitcher();
+
+        // 我的预设 = 数据目录 Presets 下全部 .mbpreset（按修改时间新 → 旧）
+        auto files = mb::SessionStore::presetDirectory()
+                        .findChildFiles (juce::File::findFiles, false, mb::S("*.mbpreset"));
+        std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b)
+        {
+            return a.getLastModificationTime() > b.getLastModificationTime();
+        });
+        presetSwitcher_ = std::make_unique<PresetSwitcherOverlay> (files);
+        // firstRun = 首启链尾（设备设置刚结束）：全新会话没有可保存的改动，
+        // 跳过「未保存改动」守卫直接应用，选完也不需要再进设备设置。
+        presetSwitcher_->onNewPreset = [this, firstRun]
+        {
+            presetPicked (firstRun, [this, firstRun]
+            {
+                if (firstRun) doNewPreset(); else newPreset();
+            });
+        };
+        presetSwitcher_->onImport = [this]
+        {
+            closePresetSwitcher();           // 先收浮层，导入完成后可再开浮层选择
+            importPreset();
+        };
+        presetSwitcher_->onPickUser = [this, firstRun] (const juce::File& f)
+        {
+            presetPicked (firstRun, [this, firstRun, f]
+            {
+                if (! firstRun && presetDirty_)
+                {
+                    promptUnsavedThen ([this, f] (int)
+                    {
+                        applyPresetFile (f, mb::tr ("已切换预设：", "Preset switched: "));
+                    });
+                    return;
+                }
+                applyPresetFile (f, mb::tr ("已切换预设：", "Preset switched: "));
+            });
+        };
+        presetSwitcher_->onPickBuiltin = [this, firstRun]
+        {
+            presetPicked (firstRun, [this, firstRun]
+            {
+                if (! firstRun && presetDirty_)
+                {
+                    promptUnsavedThen ([this] (int) { applyBuiltinPreset(); });
+                    return;
+                }
+                applyBuiltinPreset();
+            });
+        };
+        presetSwitcher_->onClose = [this]
+        {
+            closePresetSwitcher();
+        };
+        addAndMakeVisible (presetSwitcher_.get());
+        presetSwitcher_->setBounds (getLocalBounds());
+        presetSwitcher_->toFront (false);
+    }
+
+    void presetPicked (bool, const std::function<void()>& action)
+    {
+        closePresetSwitcher();
+        action();
+        // 首启链已改为「设备设置 → 选预设」，设备设置在 closeSetup 收尾，
+        // 这里不再回头弹设备设置。
+    }
+
+    void closePresetSwitcher()
+    {
+        if (presetSwitcher_ == nullptr) return;
+        removeChildComponent (presetSwitcher_.get());
+        presetSwitcher_.reset();
+        raisePluginPanels();
+    }
+
+    //==========================================================================
+    // 预设载入主体：导入 / 切换预设共用（载入文件 + 设为当前预设 + 全量刷新）
+    //==========================================================================
+    void applyPresetFile (const juce::File& f, const juce::String& okPrefix)
+    {
+        bool linkGuard = linkSyncing_;
+        linkSyncing_ = true;
+        const auto imported = mb::SessionStore::load (f);
+        const bool ok = mb::SessionStore::fromJson (imported, graph_, engine_,
+                                    engine_.catalog().inputPortCount(),
+                                    engine_.catalog().outputPortCount());
+        linkSyncing_ = linkGuard;
+        if (ok)
+        {
+            nodeCanvas_.layoutFromJson (imported.getProperty ("nodeLayout", juce::var()));
+            syncChannelNames();
+            syncAlignmentVector();
+            engine_.prepareBuffers();
+            engine_.syncDevices();
+            rebuildStrips();
+            for (auto& s : strips_) s->syncFromGraph();
+            refreshWindowWidth();            // 通道数变化后主区窗口宽度跟随预设
+            settings_.currentPreset = f.getFullPathName();
+            mb::AppSettings::save (settings_);
+            presetDirty_ = false;
+            savedSnapshot_ = mb::SessionStore::toJson (graph_, engine_, nodeCanvas_.layoutToJson());
+            setMessage (okPrefix + f.getFileName());
+            reportDroppedRoutes (okPrefix + f.getFileName());
+        }
+        else
+            setMessage (mb::tr ("预设载入失败（格式不正确）", "Preset load failed"));
+    }
+
+    //==========================================================================
+    // 内置预设：应用只有一套「默认预设」= 内嵌预设（BuiltinDefaultPreset.h，
+    // 开发者定制：快捷键/链接/右对齐齐全，直播/内录输出不回连设备 —— 防回环）。
+    // 设备连线按端口索引恢复，换设备后对不上的边按「掉边」提示，重连即可。
+    //==========================================================================
+    void applyBuiltinPreset()
+    {
+        doNewPreset();     // 清场：编辑器/播放器/插件/随通道 UI 状态全退役，清当前预设指向
+
+        const int inputs  = engine_.catalog().inputPortCount();
+        const int outputs = engine_.catalog().outputPortCount();
+
+        // 内嵌预设整体载入（与导入预设同一条 fromJson 路径）。
+        // 内嵌 JSON 是 UTF-8 字节串：必须显式走 fromUTF8 解码。
+        // juce::String(const char*) 按 ASCII 处理 8 位数据，>127 的字节会乱码。
+        const auto imported = juce::JSON::parse (juce::String::fromUTF8 (mb::builtinDefaultPresetJson()));
+        if (imported.isObject())
+        {
+            const bool linkGuard = linkSyncing_;
+            linkSyncing_ = true;
+            const bool ok = mb::SessionStore::fromJson (imported, graph_, engine_, inputs, outputs);
+            linkSyncing_ = linkGuard;
+            if (ok)
+            {
+                nodeCanvas_.layoutFromJson (imported.getProperty ("nodeLayout", juce::var()));
+                syncChannelNames();
+                syncAlignmentVector();
+                engine_.prepareBuffers();
+                engine_.syncDevices();
+                rebuildStrips();
+                for (auto& s : strips_) s->syncFromGraph();
+                refreshWindowWidth();
+                savedSnapshot_ = mb::SessionStore::toJson (graph_, engine_, nodeCanvas_.layoutToJson());
+                presetDirty_ = false;
+                setMessage (mb::tr ("已载入默认预设", "Default preset loaded"));
+                reportDroppedRoutes (mb::tr ("默认预设", "Default preset"));
+                return;
+            }
+        }
+        setMessage (mb::tr ("默认预设载入失败", "Default preset load failed"));
+    }
+
     void newPreset()
     {
         if (presetDirty_) { promptUnsavedThen ([this] (int) { doNewPreset(); }); return; }
@@ -3534,6 +3943,10 @@ private:
     void showSettings()
     {
         if (settingsPanel_ != nullptr) return;
+        // 通道少时窗口可能比设置卡片（720 + 60 边距）窄，卡片会被裁剪：
+        // 打开设置前临时撑宽窗口，关闭设置时 refreshWindowWidth() 按通道数收回。
+        if (getWidth() < kSettingsCardMinWindowWidth)
+            setSize (kSettingsCardMinWindowWidth, getHeight());
         auto p = std::make_unique<SettingsPanel> (settings_, engine_.sampleRate(), engine_);
         p->onClose = [this] { closeSettings(); };
         p->onDiagnostics = [this] { closeSettings(); showDiagnostics(); };
@@ -3642,6 +4055,7 @@ private:
         hotkeyEngine_.setSuppressed (false);   // 录入中途关闭也要恢复全局热键
         removeChildComponent (settingsPanel_.get());
         settingsPanel_.reset();
+        refreshWindowWidth();                  // 打开时若为放下设置卡片撑宽过，按通道数收回
         raisePluginPanels();
     }
 
@@ -4009,39 +4423,53 @@ private:
             {
                 const auto f = fc.getResult();
                 if (! f.existsAsFile()) return;
-                bool linkGuard = linkSyncing_;               // 装载期抑制链接联动
-                linkSyncing_ = true;
-                const auto imported = mb::SessionStore::load (f);
-                const bool ok = mb::SessionStore::fromJson (imported, graph_, engine_,
-                                            engine_.catalog().inputPortCount(),
-                                            engine_.catalog().outputPortCount());
-                linkSyncing_ = linkGuard;
-                if (ok)
+
+                // 拷贝进 Presets 目录：否则「切换预设 · 我的预设」永远列不出它
+                auto dir = mb::SessionStore::presetDirectory();
+                dir.createDirectory();
+                auto dest = dir.getChildFile (f.getFileName());
+                if (dest != f && dest.existsAsFile())
                 {
-                    nodeCanvas_.layoutFromJson (imported.getProperty ("nodeLayout", juce::var()));
-                    syncChannelNames();      // 预设里名字不足时补齐
-                    syncAlignmentVector();
-                    engine_.prepareBuffers();
-                    engine_.syncDevices();
-                    rebuildStrips();
-                    for (auto& s : strips_) s->syncFromGraph();
-                    settings_.currentPreset = f.getFullPathName();
-                    mb::AppSettings::save (settings_);
-                    presetDirty_ = false;
-                    savedSnapshot_ = mb::SessionStore::toJson (graph_, engine_, nodeCanvas_.layoutToJson());   // 导入 = 显式保存点
-                    setMessage (mb::tr ("已导入预设：", "Preset loaded: ") + f.getFileName());
-                    reportDroppedRoutes (mb::tr ("已导入预设：", "Preset loaded: ") + f.getFileName());
+                    const auto base = dest.getFileNameWithoutExtension();
+                    int n = 1;
+                    do { dest = dir.getChildFile (base + "-" + juce::String (n++) + ".mbpreset"); }
+                    while (dest.existsAsFile());
                 }
-                else
-                    setMessage (mb::tr ("预设导入失败（格式不正确）", "Preset import failed"));
+                auto target = (dest == f) ? f
+                            : (f.copyFileTo (dest) ? dest : f);   // 拷贝失败按原文件载入
+                applyPresetFile (target, mb::tr ("已导入预设：", "Preset imported: "));
             });
     }
 
     //==========================================================================
+    // 打开插件界面统一入口：内置插件开自家面板（音频播放 → 播放器面板、
+    // 其他内置 → 效果器面板），第三方 VST3 → 编辑器窗口。
+    // 经典视图与节点视图共用，保证右键菜单行为完全一致。
+    // 内置插件按通道绑定面板，未连接通道（自由停放）时提示先连接。
+    void openPluginUi (int ch, int idx)
+    {
+        const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+        if (const auto bid = engine_.pluginBank().pluginBuiltInId (bc, idx); bid > 0)
+        {
+            if (ch < 0)
+            {
+                setMessage (mb::tr ("内置插件需先连接到通道，再打开界面",
+                                    "Connect the built-in plugin to a channel first"));
+                return;
+            }
+            if (bid == 9) { showMediaPlayer (ch); return; }
+            showFx (ch, bid);
+            return;
+        }
+        openPluginEditor (ch, idx);
+    }
+
     // 插件编辑器窗口（双击通道条插件行 / 菜单「打开界面」）
     void openPluginEditor (int ch, int idx)
     {
-        auto* p = engine_.pluginBank().pluginInstance (ch, idx);
+        // 节点视图自由停放插件以 ch=-1 传入（引擎侧存在 kFreePluginSlot）
+        const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+        auto* p = engine_.pluginBank().pluginInstance (bc, idx);
         if (p == nullptr) return;
 
         for (auto* w : pluginWindows_)
@@ -4058,7 +4486,8 @@ private:
 
     void closePluginEditor (int ch, int idx)
     {
-        auto* p = engine_.pluginBank().pluginInstance (ch, idx);
+        const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+        auto* p = engine_.pluginBank().pluginInstance (bc, idx);
         if (p == nullptr) return;
         for (auto* w : pluginWindows_)
             if (w->isFor (p))
@@ -4330,12 +4759,15 @@ private:
 
     juce::Viewport nodeViewport_;
     mb::NodeCanvas nodeCanvas_;              // 节点连接视图（与调音台同一张 RouteGraph）
+    mb::NodeToolbar nodeToolbar_;            // 节点视图顶部固定工具栏（吸附 / 重置布局）
 
     DrawerButton addBtn_, newBtn_, savePresetBtn_, clearBtn_,
-                 exportBtn_, importBtn_, settingsBtn_, toggleBtn_, viewBtn_,
+                 exportBtn_, settingsBtn_, toggleBtn_, viewBtn_,
                  themeBtn_, recBtn_, foldBtn_;
     std::unique_ptr<DeviceSetupOverlay> setup_;
     std::unique_ptr<WelcomeOverlay> welcome_;      // 首次开箱：语言选择
+    bool presetAfterSetup_ = false;                // 首启链尾标记：设备设置结束后弹预设选择
+    std::unique_ptr<PresetSwitcherOverlay> presetSwitcher_;   // 预设切换浮层
     std::unique_ptr<ChannelLinkOverlay> linkOverlay_;   // 通道链接设置弹窗
     std::unique_ptr<SourcePickerOverlay> sourcePicker_; // 输入源 / 输出目标选择浮层
     std::unique_ptr<PluginPickerOverlay> pluginPicker_; // 添加插件选择浮层

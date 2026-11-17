@@ -353,6 +353,11 @@ namespace mb
     {
     public:
         static constexpr int kMaxChannels = 32;
+        /** 节点视图「未连接（自由）插件」停放槽。它不属于任何真实通道，
+            AudioEngine 只为 0..channelCount()-1 调 processChannel，因此这里
+            的插件不参与出声；把端口连到通道 = movePlugin(kFreePluginSlot→ch)，
+            圆点菜单「断开连接」= movePlugin(ch→kFreePluginSlot)。 */
+        static constexpr int kFreePluginSlot = kMaxChannels - 1;
 
         ChannelPluginBank()
         {
@@ -378,7 +383,10 @@ namespace mb
             juce::String name;
             juce::String identifier;            // VST3 文件路径，会话恢复时精确匹配
             juce::String note;                  // 插件备注（显示「备注 (插件名)」）
+            juce::String uid;                   // 稳定标识：节点视图自由摆放位置按它持久化
         };
+
+        static juce::String makeUid()           { return juce::Uuid().toString(); }
 
         /** 添加自带插件（重复添加返回提示）；参数开关由调用方经 setFxParams 同步。 */
         juce::String addBuiltIn (int ch, int id)
@@ -393,6 +401,7 @@ namespace mb
             PluginEntry e;
             e.builtInId = id;
             e.name = builtInPluginName (id);
+            e.uid = makeUid();
             v.push_back (std::move (e));
             publishLocked (ch);
             return {};
@@ -471,6 +480,26 @@ namespace mb
             v[static_cast<size_t> (idx)].note = note;
         }
 
+        /** 节点视图按 UID 记住每张插件卡片的画布位置（序号会因增删/连线而变）。 */
+        juce::String pluginUid (int ch, int idx) const
+        {
+            if (! valid (ch)) return {};
+            const juce::ScopedLock sl (lock_);
+            const auto& v = slots_[static_cast<size_t> (ch)];
+            return idx >= 0 && idx < static_cast<int> (v.size())
+                 ? v[static_cast<size_t> (idx)].uid : juce::String();
+        }
+
+        void setPluginUid (int ch, int idx, const juce::String& uid)
+        {
+            if (! valid (ch) || uid.isEmpty()) return;
+            const juce::ScopedLock sl (lock_);
+            auto& v = slots_[static_cast<size_t> (ch)];
+            if (idx < 0 || idx >= static_cast<int> (v.size())) return;
+            auto& e = v[static_cast<size_t> (idx)];
+            if (e.uid.isEmpty()) e.uid = uid;           // 旧会话存档：首次载入时补一个
+        }
+
         /** 离线插件：卸载实例释放资源，私有状态暂存；音频链上该条自动跳过。 */
         bool markOffline (int ch, int idx)
         {
@@ -532,6 +561,7 @@ namespace mb
             e.identifier = identifier;
             e.offline = true;
             e.savedState = state;
+            e.uid = makeUid();
             slots_[static_cast<size_t> (ch)].push_back (std::move (e));
             publishLocked (ch);
         }
@@ -639,6 +669,7 @@ namespace mb
             e.name = p->getName();
             e.identifier = identifier;
             e.instance = std::move (p);
+            e.uid = makeUid();
             slots_[static_cast<size_t> (ch)].push_back (std::move (e));
             publishLocked (ch);
             return err;
@@ -689,7 +720,8 @@ namespace mb
          *  order 只覆盖前 k 个通道（k = 实际通道数），其余槽位保持原位。 */
         void reorderChannels (const std::vector<int>& order)
         {
-            const int n = static_cast<int> (slots_.size());
+            // 停放槽（kFreePluginSlot）不参与通道换位 / 删除补位
+            const int n = kFreePluginSlot;
             if (order.empty() || static_cast<int> (order.size()) > n) return;
 
             std::vector<bool> seen (static_cast<size_t> (n), false);
@@ -713,10 +745,49 @@ namespace mb
                 publishLocked (i);
         }
 
+        /** 移动插件条目：src 通道第 idx 条 → dst 通道链尾，返回目标新索引（-1 失败）。
+            只搬 PluginEntry（含实例/备注/旁通/离线状态）；内置插件的 FxParams 联动
+            与播放器清理由调用方（MainComponent）负责，避免音频线程副作用。 */
+        int movePlugin (int srcCh, int idx, int dstCh)
+        {
+            if (! valid (srcCh) || ! valid (dstCh) || srcCh == dstCh) return -1;
+            const juce::ScopedLock sl (lock_);
+            auto& src = slots_[static_cast<size_t> (srcCh)];
+            if (idx < 0 || idx >= static_cast<int> (src.size())) return -1;
+            auto& dst = slots_[static_cast<size_t> (dstCh)];
+            const int newIdx = static_cast<int> (dst.size());
+            dst.push_back (std::move (src[static_cast<size_t> (idx)]));
+            src.erase (src.begin() + idx);
+            publishLocked (srcCh);
+            publishLocked (dstCh);
+            return newIdx;
+        }
+
+        /** 同通道内重排：把第 from 条移到第 to 条之前（to 为移动后目标下标）。
+            UI 的「插件 A 输出 → 插件 B 输入」连线即调用本方法表达处理顺序。
+            from/to 均按调用前的下标计算；返回是否发生变动。 */
+        bool reorderPlugin (int ch, int from, int to)
+        {
+            if (! valid (ch)) return false;
+            const juce::ScopedLock sl (lock_);
+            auto& v = slots_[static_cast<size_t> (ch)];
+            if (from < 0 || from >= static_cast<int> (v.size())
+                || to < 0 || to >= static_cast<int> (v.size()) || from == to) return false;
+            auto entry = std::move (v[static_cast<size_t> (from)]);
+            v.erase (v.begin() + from);
+            int dst = to;
+            if (from < to) --dst;                       // 前移一位补位
+            dst = juce::jlimit (0, static_cast<int> (v.size()), dst);
+            v.insert (v.begin() + dst, std::move (entry));
+            publishLocked (ch);
+            return true;
+        }
+
         /** 删除通道：其插件链退役，其后通道前移补位。 */
         void removeChannel (int ch)
         {
-            const int n = static_cast<int> (slots_.size());
+            // 停放槽（kFreePluginSlot）不参与通道换位 / 删除补位
+            const int n = kFreePluginSlot;
             if (ch < 0 || ch >= n) return;
 
             const juce::ScopedLock sl (lock_);

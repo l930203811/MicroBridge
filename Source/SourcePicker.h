@@ -20,7 +20,9 @@ public:
     juce::String title, channel, hint, titleLeft, titleRight;
     int devSplit = 0;                 // 左右栏分界 x（卡片坐标）
     std::function<void()> onCloseClicked;
-
+    std::function<void()> onConfirmClicked;   // 多选模式「确定」
+    std::function<void()> onCancelClicked;    // 多选模式「取消」
+    bool showConfirmButtons = false;          // 多选模式：底部显示 取消 / 确定
     void paint (juce::Graphics& g) override
     {
         const auto r = getLocalBounds().toFloat();
@@ -53,7 +55,29 @@ public:
         // 分隔线：标题区之下 + 左右栏之间
         g.setColour (mb::ui::border);
         g.fillRect (14, 86, w - 28, 1);
-        g.fillRect (devSplit, 86, 1, h - 86);
+        g.fillRect (devSplit, 86, 1, h - (showConfirmButtons ? 130 : 86));
+
+        // 多选模式底部按钮：左「取消」右「确定」，关闭 × 仍可用（等同取消）
+        if (showConfirmButtons)
+        {
+            g.setColour (mb::ui::border);
+            g.fillRect (14, h - 44, w - 28, 1);
+            const auto drawBtn = [&] (const juce::Rectangle<int>& r,
+                                      const juce::String& t, bool primary)
+            {
+                const bool hot = r.contains (getMouseXYRelative());
+                g.setColour (primary ? mb::ui::accent[0].withAlpha (hot ? 1.0f : 0.86f)
+                                     : mb::ui::card.withAlpha (hot ? 0.98f : 0.80f));
+                g.fillRoundedRectangle (r.toFloat(), 5.0f);
+                g.setColour (primary ? mb::ui::accent[0].brighter (0.25f) : mb::ui::border);
+                g.drawRoundedRectangle (r.toFloat(), 5.0f, 0.9f);
+                g.setFont (mb::ui::font (11.0f, true));
+                g.setColour (primary ? juce::Colours::white : mb::ui::text);
+                g.drawText (t, r, juce::Justification::centred, false);
+            };
+            drawBtn (cancelRect(), mb::tr ("取消", "Cancel"), false);
+            drawBtn (confirmRect(), mb::tr ("确定", "OK"), true);
+        }
 
         // 右上角关闭 ×
         const auto cr = closeRect();
@@ -68,8 +92,27 @@ public:
         return { getWidth() - 40, 12, 26, 26 };
     }
 
+    juce::Rectangle<int> cancelRect() const
+        { return { getWidth() - 172, getHeight() - 34, 72, 24 }; }
+
+    juce::Rectangle<int> confirmRect() const
+        { return { getWidth() - 92, getHeight() - 34, 72, 24 }; }
+
     void mouseDown (const juce::MouseEvent& ev) override
     {
+        if (showConfirmButtons)
+        {
+            if (confirmRect().contains (ev.getPosition()))
+            {
+                if (onConfirmClicked) onConfirmClicked();
+                return;
+            }
+            if (cancelRect().contains (ev.getPosition()))
+            {
+                if (onCancelClicked) onCancelClicked();
+                return;
+            }
+        }
         if (closeRect().contains (ev.getPosition()) && onCloseClicked)
             onCloseClicked();
     }
@@ -538,13 +581,31 @@ class PluginPickerOverlay : public juce::Component
 public:
     std::function<void (int id)> onPick;
     std::function<void()> onClose;
+    /** 多选模式（节点视图空白区 +插件）：勾选不立即生效，点「确定」才按勾选顺序添加。 */
+    std::function<void (const std::vector<int>& ids)> onMultiConfirm;
 
-    PluginPickerOverlay (mb::AudioEngine& engine, int ch)
-        : engine_ (engine), ch_ (ch)
+    PluginPickerOverlay (mb::AudioEngine& engine, int ch, bool multi = false)
+        : engine_ (engine), ch_ (ch), multi_ (multi)
     {
         setAlwaysOnTop (true);
         setWantsKeyboardFocus (true);
+        card_.showConfirmButtons = multi;
         card_.onCloseClicked = [this] { if (onClose) onClose(); };
+        if (multi)
+        {
+            card_.onCancelClicked = [this] { if (onClose) onClose(); };
+            card_.onConfirmClicked = [this]
+            {
+                if (onMultiConfirm)
+                {
+                    std::vector<int> ids;
+                    ids.reserve (static_cast<size_t> (selected_.size()));
+                    for (int v : selected_) ids.push_back (v);
+                    onMultiConfirm (ids);
+                }
+                if (onClose) onClose();
+            };
+        }
         vpLeft_.setViewedComponent (&leftList_, false);
         vpRight_.setViewedComponent (&rightList_, false);
         card_.addAndMakeVisible (vpLeft_);
@@ -635,8 +696,10 @@ private:
         {
             Row r; r.kind = Row::Item; r.a = p.id;
             r.text = mb::builtInPluginName (p.id);
-            for (int i = 0; i < bank.pluginCount (ch_); ++i)
-                if (bank.pluginBuiltInId (ch_, i) == p.id) { r.checked = true; break; }
+            if (multi_) r.checked = selected_.contains (p.id);
+            else
+                for (int i = 0; i < bank.pluginCount (ch_); ++i)
+                    if (bank.pluginBuiltInId (ch_, i) == p.id) { r.checked = true; break; }
             r.w = cellW (r.text, avail, minCell);
             if (x > 0 && x + r.w > avail) { x = 0; y += kRowH; }
             r.x = 12 + x; r.y = y; r.h = kRowH;
@@ -692,10 +755,14 @@ private:
             {
                 Row r; r.kind = Row::Item; r.a = 1000 + i;
                 r.text = cat.get (i).name;
-                for (int p = 0; p < engine_.pluginBank().pluginCount (ch_); ++p)
-                    if (engine_.pluginBank().pluginBuiltInId (ch_, p) <= 0
-                        && engine_.pluginBank().pluginIdentifier (ch_, p) == cat.get (i).fileOrIdentifier)
-                    { r.checked = true; break; }
+                if (multi_) r.checked = selected_.contains (1000 + i);
+                else
+                {
+                    for (int p = 0; p < engine_.pluginBank().pluginCount (ch_); ++p)
+                        if (engine_.pluginBank().pluginBuiltInId (ch_, p) <= 0
+                            && engine_.pluginBank().pluginIdentifier (ch_, p) == cat.get (i).fileOrIdentifier)
+                        { r.checked = true; break; }
+                }
                 r.w = cellW (r.text, avail, minCell);
                 if (x > 0 && x + r.w > avail) { x = 0; y += kRowH; }
                 r.x = 12 + x; r.y = y; r.h = kRowH;
@@ -784,6 +851,14 @@ private:
         const auto& r = (panel == 0 ? rowsLeft_ : rowsRight_)[static_cast<size_t> (idx)];
         if (r.kind != Row::Item) return;
         if (x < r.x || x >= r.x + r.w) return;
+        if (multi_)
+        {
+            // 多选：勾选态只存在浮层里，点「确定」才真正添加；「取消」全部丢弃
+            if (selected_.contains (r.a)) selected_.removeFirstMatchingValue (r.a);
+            else                          selected_.add (r.a);
+            rebuild();
+            return;
+        }
         if (onPick) onPick (r.a);
     }
 
@@ -809,15 +884,20 @@ private:
         card_.setBounds ((pw - w) / 2, (ph - h) / 2, w, h);
         card_.devSplit = juce::jmax (260, static_cast<int> (w * 0.42f));
 
-        card_.title = mb::tr ("添加插件", "Add Plugin");
-        card_.channel = mb::S(" (") + mb::S("CH") + juce::String (ch_ + 1) + mb::S("  ")
-                      + mb::channelDisplayName (ch_) + mb::S(")");
-        card_.hint = mb::tr ("左：内置效果 · 右：VST3 插件 · 点击条目添加到通道",
-                             "Left: built-in · right: VST3 · click an item to add");
+        card_.title = multi_ ? mb::tr ("添加插件 · 多选", "Add Plugins · multi-select")
+                             : mb::tr ("添加插件", "Add Plugin");
+        card_.channel = multi_ ? juce::String()
+                               : mb::S(" (") + mb::S("CH") + juce::String (ch_ + 1) + mb::S("  ")
+                                 + mb::channelDisplayName (ch_) + mb::S(")");
+        card_.hint = multi_
+            ? mb::tr ("左：内置效果 · 右：VST3 插件 · 勾选后点「确定」在光标处添加",
+                      "Left: built-in · right: VST3 · check items, then OK to add at cursor")
+            : mb::tr ("左：内置效果 · 右：VST3 插件 · 点击条目添加到通道",
+                      "Left: built-in · right: VST3 · click an item to add");
         card_.titleLeft  = mb::tr ("内置插件", "Built-in plugins");
         card_.titleRight = mb::tr ("第三方插件 · VST3", "Third-party plugins · VST3");
 
-        const int listY = 90, listH = h - 92;
+        const int listY = 90, listH = h - (multi_ ? 138 : 92);
         vpLeft_.setBounds  (2, listY, card_.devSplit - 2, listH);
         vpRight_.setBounds (card_.devSplit + 1, listY, w - card_.devSplit - 3, listH);
         leftList_.setSize  (card_.devSplit - 2, juce::jmax (contentLeft_, listH));
@@ -828,6 +908,8 @@ private:
 
     mb::AudioEngine& engine_;
     int ch_ = 0;
+    bool multi_ = false;
+    juce::Array<int> selected_;            // 多选勾选（按勾选顺序，即最终添加顺序）
 
     PickerCard card_;
     juce::Viewport vpLeft_, vpRight_;

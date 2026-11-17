@@ -4,7 +4,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "AudioEngine.h"
@@ -43,10 +45,46 @@ namespace mb
     public:
         std::function<void()> onChanged;                       // 图被修改（建线 / 移除）
         std::function<void (const juce::String&)> onMessage;   // 提示 / 拒绝原因
-        std::function<void (int ch)> onAddPlugin;              // 请求打开「添加插件」浮层
+        std::function<void (int ch)> onAddPlugin;              // 请求打开「添加插件」浮层（经典视图）
+        std::function<void (const juce::Point<float>& pos)> onAddFreePlugins; // 空白区右键「+插件」：在光标处添加自由插件
         std::function<void (int ch, int idx)> onOpenPlugin;    // 请求打开插件编辑器
         std::function<void (int ch, int idx)> onRemovePlugin;  // 请求移除插件（主界面收尾）
         std::function<void (int ch, bool input)> onOpenSource; // 请求打开来源选择浮层（+输入 / +输出）
+        std::function<void()> onAddChannel;                    // 空白区右键「+通道」
+        std::function<void (int ch)> onDeleteChannel;          // 通道右键「删除通道」
+        /** 插件移动 / 连接统一回调：srcCh / dstCh 可为 kFreePluginSlot；
+            targetIdx >= 0 = 插到该序号之前，-1 = 追加到链尾。 */
+        std::function<void (int srcCh, int idx, int dstCh, int targetIdx)> onMovePlugin;
+        std::function<void (int ch, int idx, const juce::String& name)> onRenamePlugin; // 插件重命名（写备注）
+        // —— 与经典视图右键菜单对齐所需的回调 ——
+        std::function<void (int ch)> onDuplicateChannel;
+        std::function<void (int ch, bool on)> onSetRightAligned;
+        std::function<void (int ch)> onLinkChannel;            // 默认动作 = -1（整通道）
+        std::function<void (int ch)> onPickColour;
+        std::function<void (int ch, bool hidden)> onSetHidden;
+        std::function<void()> onShowAllChannels;
+        std::function<void (int ch, int idx)> onPluginBypass;
+        std::function<void (int ch, int idx)> onPluginOffline;
+        std::function<void (int ch, int action)> onPluginLink;
+        std::function<void()> onSnapChanged;                 // 吸附状态变化（刷新固定工具栏按钮）
+
+        /** 顶部固定工具栏的操作入口（工具栏已移出画布，见 NodeToolbar）。 */
+        bool isSnapOn() const noexcept { return snapOn_; }
+        void toggleSnap()
+        {
+            snapOn_ = ! snapOn_;
+            if (onMessage) onMessage (snapOn_
+                ? mb::tr ("网格吸附已开启", "Grid snap on")
+                : mb::tr ("网格吸附已关闭", "Grid snap off"));
+            if (onSnapChanged) onSnapChanged();
+            repaint();
+        }
+        void resetNodeLayout()
+        {
+            chOff_.clear(); inOff_.clear(); outOff_.clear();
+            updateSize(); repaint();
+            if (onMessage) onMessage (mb::tr ("已重置节点布局", "Node layout reset"));
+        }
 
         NodeCanvas (mb::RouteGraph& graph, mb::AudioEngine& engine)
             : graph_ (graph), engine_ (engine), catalog_ (engine.catalog())
@@ -106,12 +144,15 @@ namespace mb
                         juce::Rectangle<int> (metrics_.outX, kToolbarH + 10, metrics_.outW, 16),
                         juce::Justification::centredRight, false);
 
-            drawToolbar (g);
+            // 顶部工具栏已移出画布，改由 MainComponent 的 NodeToolbar 覆盖层固定显示
             drawPorts (g, true);
             drawPorts (g, false);
-            drawChannels (g);
-            drawEdges (g);
+            drawPlugChains (g);                 // 插件链：相邻插件的输入/输出点自动连线（表达顺序）
+            drawEdges (g);                      // 连接线先画
+            drawChannels (g);                   // 通道卡片盖在连线上（与插件卡片一致）
+            drawPlugCards (g);                  // 插件卡片盖在连线上，避免连线穿过卡片文字
             drawPending (g);
+            drawPlugDragGhost (g);
             drawHoverLabel (g);
         }
 
@@ -124,24 +165,12 @@ namespace mb
             computeLayout();
             const auto p = ev.position;
 
-            // 右键不再提供菜单（吸附 / 重置布局在顶部工具栏；节点操作走
-            // 三区正文与双击端口圆点）
-
-            // 顶部工具栏：吸附开关 / 重置布局（唯一入口）
-            if (toolSnapRect().contains (p))
+            // —— 右键菜单：空白 / 通道卡片 / 插件卡片 各不同 ——
+            if (ev.mods.isRightButtonDown())
             {
-                snapOn_ = ! snapOn_;
-                if (onMessage) onMessage (snapOn_
-                    ? mb::tr ("网格吸附已开启", "Grid snap on")
-                    : mb::tr ("网格吸附已关闭", "Grid snap off"));
-                repaint();
-                return;
-            }
-            if (toolResetRect().contains (p))
-            {
-                chOff_.clear(); inOff_.clear(); outOff_.clear();
-                updateSize(); repaint();
-                if (onMessage) onMessage (mb::tr ("已重置节点布局", "Node layout reset"));
+                if (const auto* pc = pluginCardAt (p))       showPluginContextMenu (*pc, p);
+                else if (channelAt (p) >= 0)                  showChannelContextMenu (channelAt (p), p);
+                else                                          showCanvasContextMenu (p);
                 return;
             }
 
@@ -168,30 +197,17 @@ namespace mb
                         repaint();
                         return;
                     }
-                    // 三区正文：三个「+」区都调用调音台的对应浮层
-                    if (inputZoneFor (ch).contains (p))
-                    {
-                        if (onOpenSource) onOpenSource (ch, true);   // 「+输入」浮层
-                        return;
-                    }
-                    if (pluginZoneFor (ch).contains (p))
-                    {
-                        if (onAddPlugin) onAddPlugin (ch);           // 「+插件」浮层
-                        return;
-                    }
-                    if (outputZoneFor (ch).contains (p))
-                    {
-                        if (onOpenSource) onOpenSource (ch, false);  // 「+输出」浮层
-                        return;
-                    }
                 }
             }
 
-            if (const auto edge = edgeAt (p))
+            // —— 卡片优先于连线：点在任意卡片上只操作卡片，不穿透命中其下方的连线 ——
+            if (const auto* pc = pluginCardAt (p))   // 插件卡片本体 = 自由拖动改位置（落到通道 = 连接）
             {
-                showRemoveMenu (*edge, p);
-                pending_.reset();
-                repaint();
+                dragging_ = DragNode { DragNode::Plug, pc->ch, pc->idx };
+                dragHome_ = { pc->rect.getX(), pc->rect.getY() };
+                dragGrab_ = dragHome_ - p;
+                const int bc = pc->ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : pc->ch;
+                dragPlugUid_ = engine_.pluginBank().pluginUid (bc, pc->idx);
                 return;
             }
 
@@ -202,16 +218,36 @@ namespace mb
                 dragGrab_ = dragHome_ - p;
                 return;
             }
+
+            if (overAnyCard (p)) return;             // 空槽等不可拖卡片：吞掉点击，仍不碰连线
+
+            if (const auto edge = edgeAt (p))        // 仅空白处才命中连线 → 移除菜单
+            {
+                showRemoveMenu (*edge, p);
+                pending_.reset();
+                repaint();
+                return;
+            }
         }
 
         void mouseDrag (const juce::MouseEvent& ev) override
         {
             if (dragging_)
             {
-                const auto target = snapPoint (ev.position + dragGrab_);
-                setNodeOffset (*dragging_, target - dragHome_);
                 mousePos_ = ev.position;
-                updateSize();
+                if (dragging_->kind == DragNode::Plug)
+                {
+                    // 插件卡片 = 真正的自由节点：拖动直接改自身位置
+                    if (dragPlugUid_.isNotEmpty())
+                        plugPos_[dragPlugUid_] = snapPoint (ev.position + dragGrab_);
+                    updateSize();
+                }
+                else                                    // 通道 / 端口节点：相对「家」的偏移
+                {
+                    const auto target = snapPoint (ev.position + dragGrab_);
+                    setNodeOffset (*dragging_, target - dragHome_);
+                    updateSize();
+                }
                 repaint();
                 return;
             }
@@ -224,19 +260,39 @@ namespace mb
         {
             if (dragging_)
             {
+                const auto dn = *dragging_;
                 dragging_.reset();
-                if (onChanged) onChanged();                  // 持久化节点布局
+                if (dn.kind == DragNode::Plug)
+                {
+                    // 插件卡片落在某通道卡片上 = 建立归属连接；落空 = 仅保留新的自由位置
+                    if (ev.getDistanceFromDragStart() > 8)
+                    {
+                        const int dst = channelAt (ev.position);
+                        if (dst >= 0 && dst != dn.id && onMovePlugin)
+                        {
+                            const int src = dn.id < 0 ? mb::ChannelPluginBank::kFreePluginSlot : dn.id;
+                            onMovePlugin (src, dn.plugIdx, dst, -1);
+                            if (onMessage) onMessage (mb::tr ("已连接插件到 ", "Plugin connected to ")
+                                + mb::channelDisplayName (dst));
+                        }
+                        if (onChanged) onChanged();        // 持久化新位置
+                    }
+                }
+                else if (onChanged) onChanged();             // 持久化节点布局
                 repaint();
                 return;
             }
             if (! pending_) return;
 
-            // 原地松手（位移 <8px）= 点击连接点：弹出锚定该点的连接列表（可逐条移除）
+            // 原地松手（位移 <8px）= 点击连接点
             if (ev.getDistanceFromDragStart() <= 8)
             {
                 const auto a = *pending_;
                 pending_.reset();
-                showAnchorMenu (a, ev.position);
+                if (a.kind == Anchor::PlugIn || a.kind == Anchor::PlugOut)
+                    showPlugDotMenu (a, ev.position);
+                else
+                    showAnchorMenu (a, ev.position);
                 repaint();
                 return;
             }
@@ -272,10 +328,7 @@ namespace mb
             }
             if (key.getTextCharacter() == 'g' || key.getTextCharacter() == 'G')
             {
-                snapOn_ = ! snapOn_;
-                if (onMessage) onMessage (mb::tr ("网格吸附：", "Grid snap: ")
-                                          + (snapOn_ ? mb::tr ("开", "On") : mb::tr ("关", "Off")));
-                repaint();
+                toggleSnap();
                 return true;
             }
             return false;
@@ -285,9 +338,9 @@ namespace mb
         {
             lastMouse_ = ev.position;
             const auto a = anchorAt (ev.position);
-            const int e = edgeIndexAt (ev.position);
-            const int tool = toolHit (ev.position) ? 4 : 0;
-            const int hover = (a ? 1 : 0) | (e >= 0 ? 2 : 0) | tool;
+            // 卡片盖在连线上：鼠标在卡片上时取消连线悬停（不显示连接名 / 手型）
+            const int e = overAnyCard (ev.position) ? -1 : edgeIndexAt (ev.position);
+            const int hover = (a ? 1 : 0) | (e >= 0 ? 2 : 0);
             if (hover != hoverFlag_ || e != hoverEdge_)
             {
                 hoverFlag_ = hover;
@@ -311,8 +364,10 @@ namespace mb
         // 几何常量
         //======================================================================
         static constexpr int kMargin = 12;
-        static constexpr int kBaseWidth = 792;          // 基准布局 12+210+108+160+90+200+12
-        static constexpr int kMinCanvasWidth = 620;     // 窄窗口下限（超出部分由水平滚动兜底）
+        // 端口列再收 1/5（168→134 / 160→128），通道列收 1/4（160→120）；
+        // 基准 = 12+134+108+120+90+128+12 = 604
+        static constexpr int kBaseWidth = 604;
+        static constexpr int kMinCanvasWidth = 540;     // 窄窗口下限（超出部分由水平滚动兜底）
         // 紧凑纵向排布只作用于端口列：同一设备的 L/R 声道行几乎贴合（仅 2px 缝），
         // 设备分组标题只占 13px（原值：端口 42/34、分组 18），多设备时不必翻页。
         // 通道列节点高度随插件数变化（chNodeH），并按左右端口列的总高度垂直居中。
@@ -321,12 +376,14 @@ namespace mb
         static constexpr int kPortPitch = 28, kPortH = 26;
         // 通道节点为紧凑三区卡片：头部（编号 + 名称 + 制式 + M/S）+ 三区正文
         // （左输入 / 中插件 / 右输出，不再列出插件行），连接点锚定头部中心。
-        static constexpr int kChHeadH   = 28;           // 头部行高（名称 + 制式）
-        static constexpr int kChGap     = 12;           // 通道节点纵向间距
+        static constexpr int kChHeadH   = 28;           // 头部行高（名称 + 制式）= 通道卡片高度
+        static constexpr int kChGap     = 19;           // 通道节点纵向间距 = 卡片高度的 2/3（28×2/3≈19）
         static constexpr int kBodyMinH  = 34;           // 三区正文高度（保底）
         static constexpr int kGroupH = 13;
         static constexpr float kDotR = 5.0f, kDotHit = 9.0f;
         static constexpr float kMonoOffset = 7.0f;      // 通道 L/R 小点相对锚点的上下偏移（下半区）
+        // 插件卡片：贴在所属通道左侧，宽 86 / 高 24，纵向按插件序号堆叠
+        static constexpr int kPlugW = 86, kPlugH = 24, kPlugGap = 4;
 
         /** 三列横向几何：由 computeMetrics() 按主区宽度现算；基准宽度下还原旧布局。 */
         struct Metrics
@@ -352,9 +409,11 @@ namespace mb
             const float extra = static_cast<float> (usable - kBaseWidth);
 
             Metrics m;
-            m.inW  = juce::jlimit (170, 420, juce::roundToInt (210.0f + extra * 0.20f));
-            m.chW  = juce::jlimit (150, 300, juce::roundToInt (160.0f + extra * 0.12f));
-            m.outW = juce::jlimit (160, 400, juce::roundToInt (200.0f + extra * 0.20f));
+            // 端口列较上一版再收 1/5（134 / 128），通道列收 1/4（120），
+            // 腾出的宽度进入列间留白；宽窗口仍按比例同步放大。
+            m.inW  = juce::jlimit (112, 336, juce::roundToInt (134.0f + extra * 0.16f));
+            m.chW  = juce::jlimit (110, 300, juce::roundToInt (120.0f + extra * 0.12f));
+            m.outW = juce::jlimit (104, 320, juce::roundToInt (128.0f + extra * 0.16f));
             const int gaps = juce::jmax (90, usable - (2 * kMargin + m.inW + m.chW + m.outW));
             m.gapL = juce::roundToInt (gaps * 0.545f);
             m.gapR = gaps - m.gapL;
@@ -374,17 +433,19 @@ namespace mb
         //======================================================================
         struct Anchor
         {
-            enum Kind { InPort, OutPort, ChIn, ChOut } kind = InPort;
-            int id = -1;                                // 端口序号 / 通道序号
+            enum Kind { InPort, OutPort, ChIn, ChOut, PlugIn, PlugOut } kind = InPort;
+            int id = -1;                                // 端口序号 / 通道序号 / 插件所属通道
             juce::Point<float> pos;                     // 点中心（画布坐标）
             bool hidden = false;                        // 未勾选的辅助设备：不画、不可点
             /** 通道连接点角色：0 = 左单声道 L（上），1 = 立体声 L+R（中间大点），
                 2 = 右单声道 R（下）。端口连接点恒为 1。放在末尾可让原有
-                聚合初始化 { kind, id, pos } / { kind, id, pos, hidden } 保持不变。 */
+                聚合初始化 { kind, id, pos } / { kind, id, pos, hidden } 保持不变。
+                PlugIn / PlugOut：id = 通道号，plugIdx = 插件序号，role = 0(L)/2(R)。 */
             int role = 1;
+            int plugIdx = -1;                           // PlugIn/PlugOut：插件在该通道链中的序号
 
             bool operator== (const Anchor& o) const noexcept
-                { return kind == o.kind && id == o.id && role == o.role; }
+                { return kind == o.kind && id == o.id && role == o.role && plugIdx == o.plugIdx; }
         };
 
         static float dotRadius (const Anchor&) noexcept { return kDotR; }
@@ -400,12 +461,22 @@ namespace mb
             bool arrow = false;                          // C→C：终点画方向箭头
         };
 
+        /** 一张插件卡片 = 通道插件链里的一条（投影，不是独立音源）。
+            ch/idx 定位到 pluginBank().slots_[ch][idx]；左右点用于表达「顺序与归属」。 */
+        struct PlugCard
+        {
+            int ch = -1, idx = -1;
+            juce::Rectangle<float> rect;
+            Anchor inL, inR, outL, outR;                // 左输入 L/R + 右输出 L/R
+        };
+
         struct Layout
         {
             std::vector<Anchor> inDots, outDots;         // 下标 = 端口序号
             std::vector<Anchor> chInDots, chOutDots;     // 下标 = 通道序号：中间立体声大点
             std::vector<Anchor> chInL, chInR, chOutL, chOutR;   // 左右单声道小点
             std::vector<juce::Rectangle<float>> inCards, chCards, outCards;
+            std::vector<PlugCard> plugCards;            // 插件卡片（扁平，按 ch→idx 顺序）
             int bottom = kTop;
         };
 
@@ -419,10 +490,13 @@ namespace mb
         juce::Point<float> mousePos_;
 
         // 自由画布：节点位置覆盖（相对三列「家」布局的偏移；拖动后生效）
-        mutable std::vector<juce::Point<float>> chOff_, inOff_, outOff_;
-        bool snapOn_ = true;                            // 网格吸附（顶部工具栏 / 'G' 切换）
+        mutable         std::vector<juce::Point<float>> chOff_, inOff_, outOff_;
+        // 插件卡片位置按 UID 存（序号会因增删 / 连接而变），绝对画布坐标 = 卡片左上角
+        std::map<juce::String, juce::Point<float>> plugPos_;
+        mutable juce::String dragPlugUid_;
+        bool snapOn_ = false;                           // 网格吸附（顶部工具栏 / 'G' 切换）；默认关闭，自由摆放
         float grid_  = 20.0f;                           // 吸附网格尺寸
-        struct DragNode { enum Kind { Ch, In, Out } kind; int id; };
+        struct DragNode { enum Kind { Ch, In, Out, Plug } kind; int id; int plugIdx = -1; };
         std::optional<DragNode> dragging_;
         juce::Point<float> dragGrab_;                    // 鼠标相对节点原点的抓取偏移
         juce::Point<float> dragHome_;                    // 拖动起点时节点的「家」坐标（零偏移）
@@ -437,11 +511,12 @@ namespace mb
         const mb::DeviceCatalog& catalog_;
 
         //======================================================================
-        /** 通道节点高度 = 头部（编号 + 名称 + 制式 + M/S）+ 三区正文（固定高度，
-            不再随插件数变化）；空槽同样占位保持对齐。 */
+        /** 通道节点高度 = 仅头部（编号 + 名称 + 制式 + M/S）。
+            已移除下方「+输入 / +插件 / +输出」三区正文；连接点锚定头部垂直中心。
+            空槽同样占位保持对齐。 */
         int chNodeH (int) const
         {
-            return kChHeadH + kBodyMinH;
+            return kChHeadH;
         }
 
         //======================================================================
@@ -535,15 +610,36 @@ namespace mb
             }
             layout_.bottom = juce::jmax (layout_.bottom, static_cast<int> (y));
 
-            // 通道列按同一内容区居中；节点高度随插件数变化（迷你调音台条）
-            y = columnTop (chH);
+            /** 一张插件卡：优先按 UID 取用户摆放的绝对坐标，未摆放过才用默认位置。
+                ch = -1 表示自由插件（引擎侧存在 kFreePluginSlot）。 */
+            auto makePlugCard = [this] (int ch, int idx, float defX, float defY) -> PlugCard
+            {
+                PlugCard pc;
+                pc.ch = ch; pc.idx = idx;
+                const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+                const auto uid = engine_.pluginBank().pluginUid (bc, idx);
+                const auto it = plugPos_.find (uid);
+                const float px = it != plugPos_.end() ? it->second.x : defX;
+                const float py = it != plugPos_.end() ? it->second.y : defY;
+                pc.rect = { px, py, static_cast<float> (kPlugW), static_cast<float> (kPlugH) };
+                const float iy = py + kPlugH * 0.32f, oy2 = py + kPlugH * 0.68f;
+                pc.inL  = { Anchor::PlugIn,  ch, { px, iy  }, false, 0, idx };
+                pc.inR  = { Anchor::PlugIn,  ch, { px, oy2 }, false, 2, idx };
+                pc.outL = { Anchor::PlugOut, ch, { px + kPlugW, iy  }, false, 0, idx };
+                pc.outR = { Anchor::PlugOut, ch, { px + kPlugW, oy2 }, false, 2, idx };
+                return pc;
+            };
+
+            // 通道列固定贴顶：不再与端口列垂直居中。端口多时旧逻辑把通道整列
+            // 下压 (contentH-chH)/2，顶部空出一大片且拖动上限又受 home 牵连够不到顶。
+            y = static_cast<float> (kTop);
             for (int c = 0; c < graph_.channelCount(); ++c)
             {
                 const float ox = chOff_[static_cast<size_t> (c)].x, oy = chOff_[static_cast<size_t> (c)].y;
                 const float xIn  = static_cast<float> (metrics_.chX) + ox;
                 const float xOut = xIn + static_cast<float> (metrics_.chW);
-                // 连接点锚定正文下半区（约卡片高度 75% 处），L/R 小点以其为中心 ±7px
-                const auto cy = y + static_cast<float> (chNodeH (c)) * 0.75f + oy;
+                // 连接点锚定头部垂直中心，L/R 小点以其为中心 ±7px
+                const auto cy = y + static_cast<float> (chNodeH (c)) * 0.5f + oy;
                 // 空槽不画点：同时标记为 hidden，避免留下看不见却能命中的连接点
                 const bool skip = mb::ui::slotState (c) == mb::ui::kSlotEmpty;
                 layout_.chCards.push_back ({ xIn, y + oy, static_cast<float> (metrics_.chW),
@@ -566,7 +662,33 @@ namespace mb
                     layout_.chOutL.push_back ({ Anchor::ChOut, c, { xOut, cy }, skip, 0 });
                     layout_.chOutR.push_back ({ Anchor::ChOut, c, { -9999.0f, -9999.0f }, true, 2 });
                 }
+                // 插件卡片：贴在所属通道左侧留白内，按插件序号纵向堆叠。
+                // 纯投影：数据来自 pluginBank；左右 L/R 小点表达「顺序（插件→插件）」与
+                // 「归属（插件→通道）」，不连设备端口。
+                if (! skip)
+                {
+                    const int n = engine_.pluginBank().pluginCount (c);
+                    for (int i = 0; i < n; ++i)
+                        layout_.plugCards.push_back (makePlugCard (
+                            c, i, xIn - static_cast<float> (kPlugW) - 16.0f,
+                            y + oy + static_cast<float> (i * (kPlugH + kPlugGap))));
+                }
                 y += static_cast<float> (chNodeH (c) + kChGap);
+            }
+
+            // 自由插件（未连接任何通道）：默认放在输入列右侧留白里，
+            // 实际位置由 setPluginPosition() / 拖动写入的 plugPos_ 决定。
+            {
+                constexpr int fs = mb::ChannelPluginBank::kFreePluginSlot;
+                const int n = engine_.pluginBank().pluginCount (fs);
+                for (int i = 0; i < n; ++i)
+                {
+                    const float dx = static_cast<float> (metrics_.inX + 18
+                                       + (i % 3) * (kPlugW + kPlugGap + 8));
+                    const float dy = static_cast<float> (kTop + 16
+                                       + (i / 3) * (kPlugH + kPlugGap + 8));
+                    layout_.plugCards.push_back (makePlugCard (-1, i, dx, dy));
+                }
             }
             layout_.bottom = juce::jmax (layout_.bottom, static_cast<int> (y));
 
@@ -609,6 +731,8 @@ namespace mb
                 scanBottom (layout_.inCards);
                 scanBottom (layout_.chCards);
                 scanBottom (layout_.outCards);
+                for (const auto& pc : layout_.plugCards)
+                    maxBottom = juce::jmax (maxBottom, juce::roundToInt (pc.rect.getBottom()));
                 layout_.bottom = maxBottom;
             }
             layoutBottom_ = layout_.bottom;
@@ -783,51 +907,6 @@ namespace mb
         }
 
         //======================================================================
-        // 顶部工具栏：节点视图常用功能固定显示（吸附 / 重置布局的唯一入口）
-        //======================================================================
-        juce::Rectangle<float> toolSnapRect() const
-            { return { static_cast<float> (metrics_.canvasW - 142.0f), 6.0f, 64.0f, 18.0f }; }
-        juce::Rectangle<float> toolResetRect() const
-            { return { static_cast<float> (metrics_.canvasW - 72.0f), 6.0f, 60.0f, 18.0f }; }
-
-        void drawToolButton (juce::Graphics& g, const juce::Rectangle<float>& r,
-                             const juce::String& text, bool lit)
-        {
-            const bool hot = r.contains (lastMouse_);
-            g.setColour ((lit ? mb::ui::accent[0].withAlpha (0.20f)
-                              : mb::ui::card.withAlpha (hot ? 0.95f : 0.72f)));
-            g.fillRoundedRectangle (r, 4.0f);
-            g.setColour ((lit ? mb::ui::accent[0] : mb::ui::border).withAlpha (hot ? 0.9f : 0.6f));
-            g.drawRoundedRectangle (r, 4.0f, 0.8f);
-            g.setFont (mb::ui::font (8.5f, lit));
-            g.setColour (lit ? mb::ui::accent[0].brighter (0.2f) : mb::ui::subText);
-            g.drawText (text, r.toNearestInt(), juce::Justification::centred, false);
-        }
-
-        void drawToolbar (juce::Graphics& g)
-        {
-            // 独立工具栏带：底色 + 底部分隔线，与下方三列列头明确分区
-            g.setColour (mb::ui::topBar.withAlpha (0.92f));
-            g.fillRect (0.0f, 0.0f, static_cast<float> (metrics_.canvasW),
-                        static_cast<float> (kToolbarH));
-            g.setColour (mb::ui::border.withAlpha (0.85f));
-            g.drawHorizontalLine (kToolbarH - 1, 0.0f,
-                                  static_cast<float> (metrics_.canvasW));
-            // 标题文字已移除：工具栏带本身 + 底部分隔线已足够表意，避免多余占位
-            drawToolButton (g, toolSnapRect(),
-                            snapOn_ ? mb::tr ("吸附 开", "Snap on")
-                                    : mb::tr ("吸附 关", "Snap off"),
-                            snapOn_);
-            drawToolButton (g, toolResetRect(),
-                            mb::tr ("重置布局", "Reset layout"), false);
-        }
-
-        bool toolHit (const juce::Point<float>& p) const
-        {
-            return toolSnapRect().contains (p) || toolResetRect().contains (p);
-        }
-
-        //======================================================================
         void drawPorts (juce::Graphics& g, bool input)
         {
             const auto& ports = input ? catalog_.inputPorts() : catalog_.outputPorts();
@@ -904,26 +983,23 @@ namespace mb
                     continue;
                 }
 
-                // 卡片主体：头部（标题窗按钮 + 名称 + M/S）+ 三区正文，之间细分隔线
+                // 卡片主体：仅头部（编号 + 名称 + 制式）；已移除下方三区正文
                 g.setColour (mb::ui::card.withAlpha (0.85f * alpha));
                 g.fillRoundedRectangle (card, 5.0f);
                 g.setColour (colour.withAlpha (0.85f * alpha));
                 g.drawRoundedRectangle (card, 5.0f, 1.0f);
-                const auto head = card.removeFromTop ((float) kChHeadH);
-                g.setColour (mb::ui::border.withAlpha (0.35f * alpha));
-                g.drawHorizontalLine (juce::roundToInt (head.getBottom()),
-                                      card.getX() + 4.0f, card.getRight() - 4.0f);
+                const auto head = card;
 
                 g.setFont (mb::ui::font (8.6f, true));
                 g.setColour (mb::ui::faintText.withAlpha (alpha));
                 g.drawText (mb::S("CH") + juce::String (c + 1),
-                            head.getX() + 8.0f, head.getY(), 30.0f, head.getHeight(),
+                            head.getX() + 6.0f, head.getY(), 26.0f, head.getHeight(),
                             juce::Justification::centredLeft, false);
                 g.setFont (mb::ui::font (9.0f));
                 g.setColour (mb::ui::text.withAlpha (alpha));
                 g.drawText (mb::channelDisplayName (c),
-                            head.getX() + 38.0f, head.getY(),
-                            head.getWidth() - 120.0f, head.getHeight(),
+                            head.getX() + 30.0f, head.getY(),
+                            juce::jmax (12.0f, head.getWidth() - 76.0f), head.getHeight(),
                             juce::Justification::centredLeft, true);
 
                 // 通道链接角标：头部 M/S 左侧（如 A1）；制式徽标恒占右端，链接码左移
@@ -931,7 +1007,7 @@ namespace mb
                     const auto code = mb::links::codeString (mb::links::primaryOf (c));
                     if (code.isNotEmpty())
                     {
-                        const float codeX = -76.0f;
+                        const float codeX = -52.0f;
                         g.setFont (mb::ui::font (7.0f, true));
                         g.setColour (colour.withAlpha (alpha));
                         g.drawText (code, head.getRight() + codeX, head.getY(),
@@ -950,8 +1026,6 @@ namespace mb
                                 monoRectFor (c).toNearestInt(),
                                 juce::Justification::centred, false);
                 }
-
-                drawBodyZones (g, c, alpha);               // 三区正文（左入 / 中插件 / 右出）
 
                 // 悬空角标：设备不匹配导致本通道部分路由未恢复（红色 ! ）
                 if (std::find (dropped.begin(), dropped.end(), c) != dropped.end())
@@ -984,26 +1058,119 @@ namespace mb
             }
         }
 
-        /** 三区正文：两条细分隔线分出 左输入 / 中插件 / 右输出，各区居中「+」按钮样式。
-            中间插件区不列出插件行——点击 = 调音台对应窗口列表；左右区点击 = 来源选择浮层。 */
-        void drawBodyZones (juce::Graphics& g, int c, float alpha)
+        /** 插件链自动连线：同一通道相邻插件「上一个的输出 → 下一个的输入」，
+            以及末个插件输出 → 通道左侧输入点。仅表达数组顺序（投影），不是独立路由边；
+            颜色取所属通道色，圆点端画小箭头表意。 */
+        void drawPlugChains (juce::Graphics& g)
         {
-            const auto b = bodyRectFor (c);
-            const auto inZ = inputZoneFor (c);
-            const auto plugZ = pluginZoneFor (c);
+            const float phase = static_cast<float> (
+                juce::Time::getMillisecondCounter() % 1600) / 1600.0f;
+            const auto& pcs = layout_.plugCards;
+            size_t i = 0;
+            while (i < pcs.size())
+            {
+                const int ch = pcs[i].ch;
+                size_t j = i;
+                while (j < pcs.size() && pcs[j].ch == ch) ++j;   // [i, j) = 同一通道的插件链
+                const auto colour = mb::ui::stripColour (juce::jmax (0, ch));
+                // 链内流动光点随所在通道电平点亮（播放器 / 麦克风等任何链内音源）；
+                // 自由停放插件（ch < 0）没有路由语义，保持静态线不点亮。
+                const float level = ch >= 0
+                    ? mb::ui::levelToMeter (engine_.channelPeak (ch)) : 0.0f;
 
-            g.setColour (mb::ui::border.withAlpha (0.28f * alpha));
-            g.drawVerticalLine (juce::roundToInt (inZ.getRight()), b.getY() + 2.0f, b.getBottom() - 2.0f);
-            g.drawVerticalLine (juce::roundToInt (plugZ.getRight()), b.getY() + 2.0f, b.getBottom() - 2.0f);
+                for (size_t k = i; k < j; ++k)
+                {
+                    const auto& cur = pcs[k];
+                    // 相邻插件：cur.outL/inR → next.inL/inR（L 对 L、R 对 R）
+                    if (k + 1 < j)
+                    {
+                        const auto& nxt = pcs[k + 1];
+                        drawPlugLink (g, cur.outL.pos, nxt.inL.pos, colour, level, phase);
+                        drawPlugLink (g, cur.outR.pos, nxt.inR.pos, colour, level, phase);
+                    }
+                    else if (ch >= 0 && ! layout_.chInL.empty())
+                    {
+                        // 末插件 → 通道左输入（L→L / R→R），落入通道卡片左缘
+                        const auto& dstL = layout_.chInL[static_cast<size_t> (ch)];
+                        const auto& dstR = layout_.chInR[static_cast<size_t> (ch)];
+                        drawPlugLink (g, cur.outL.pos, dstL.pos, colour, level, phase);
+                        if (! dstR.hidden) drawPlugLink (g, cur.outR.pos, dstR.pos, colour, level, phase);
+                    }
+                }
+                i = j;
+            }
+        }
 
-            g.setFont (mb::ui::font (9.5f));
-            g.setColour (mb::ui::text.withAlpha (0.85f * alpha));
-            g.drawText (mb::S("+") + mb::tr ("输入", "In"),    inZ.toNearestInt(),
-                        juce::Justification::centred, false);
-            g.drawText (mb::S("+") + mb::tr ("插件", "FX"),    plugZ.toNearestInt(),
-                        juce::Justification::centred, false);
-            g.drawText (mb::S("+") + mb::tr ("输出", "Out"),   outputZoneFor (c).toNearestInt(),
-                        juce::Justification::centred, false);
+        /** 插件链连线：贝塞尔静态线 + 沿曲线流动的电平光点（与主连线同款，
+            无声时只剩静态线，不画呼吸点——链线较细，避免常亮噪音）。 */
+        void drawPlugLink (juce::Graphics& g, juce::Point<float> a,
+                           juce::Point<float> b, juce::Colour colour,
+                           float level = 0.0f, float phase = 0.0f)
+        {
+            const float bend = juce::jmax (12.0f, (b.x - a.x) * 0.5f);
+            const auto c1 = juce::Point<float> { a.x + bend, a.y };
+            const auto c2 = juce::Point<float> { b.x - bend, b.y };
+            juce::Path p;
+            p.startNewSubPath (a);
+            p.cubicTo (c1, c2, b);
+            g.setColour (colour.withAlpha (0.55f));
+            g.strokePath (p, juce::PathStrokeType (1.5f));
+
+            if (level <= 0.0f) return;
+            const float t = juce::jlimit (0.0f, 1.0f, phase * (0.75f + 0.5f * level));
+            const float u = 1.0f - t;
+            const auto pos = u * u * u * a + 3.0f * u * u * t * c1
+                           + 3.0f * u * t * t * c2 + t * t * t * b;
+            const float r = 2.0f + 1.2f * level;
+            g.setColour (juce::Colours::white.withAlpha (0.25f + 0.7f * level));
+            g.fillEllipse (pos.x - r, pos.y - r, r * 2.0f, r * 2.0f);
+        }
+
+        /** 插件卡片：小圆角卡 + 名称/备注文字 + 左侧 L/R 输入点 + 右侧 L/R 输出点。 */
+        void drawPlugCards (juce::Graphics& g)
+        {
+            for (const auto& pc : layout_.plugCards)
+            {
+                const int bc = pc.ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : pc.ch;
+                const auto& bank = engine_.pluginBank();
+                const auto colour = mb::ui::stripColour (juce::jmax (0, pc.ch));
+                const bool bypass = bank.pluginBypass (bc, pc.idx);
+                const float alpha = bypass ? 0.5f : 1.0f;
+                const auto note = bank.pluginNote (bc, pc.idx);
+                const auto name = bank.pluginName (bc, pc.idx);
+                const auto label = (pc.ch < 0 ? mb::S("◇ ") : juce::String())
+                                 + (note.isNotEmpty() ? note + mb::S(" (") + name + mb::S(")") : name);
+
+                g.setColour (mb::ui::card.withAlpha (0.92f * alpha));
+                g.fillRoundedRectangle (pc.rect, 4.0f);
+                g.setColour (colour.withAlpha (0.9f * alpha));
+                g.drawRoundedRectangle (pc.rect, 4.0f, 1.0f);
+
+                g.setFont (mb::ui::font (8.0f));
+                g.setColour (mb::ui::text.withAlpha (alpha));
+                g.drawFittedText (label,
+                                  juce::Rectangle<int> (pc.rect.getX() + 10, pc.rect.getY(),
+                                                        pc.rect.getWidth() - 20, pc.rect.getHeight()),
+                                  juce::Justification::centred, 1, 0.6f);
+
+                // 左输入（空心）/ 右输出（实心带芯），悬停放大
+                auto drawDot = [&] (const Anchor& d, bool inSide)
+                {
+                    const bool hot = isHot (d);
+                    const float r = kDotR * 0.8f + (hot ? 1.6f : 0.0f);
+                    g.setColour ((hot ? juce::Colours::white : colour).withAlpha (0.95f * alpha));
+                    g.fillEllipse (d.pos.x - r, d.pos.y - r, r * 2.0f, r * 2.0f);
+                    if (inSide && ! hot)
+                    {
+                        g.setColour (mb::ui::background.withAlpha (0.9f));
+                        g.fillEllipse (d.pos.x - r * 0.5f, d.pos.y - r * 0.5f, r, r);
+                    }
+                };
+                drawDot (pc.inL, true);
+                drawDot (pc.inR, true);
+                drawDot (pc.outL, false);
+                drawDot (pc.outR, false);
+            }
         }
 
         /** 通道连接点：L（上小点）/ R（下小点）。
@@ -1150,6 +1317,21 @@ namespace mb
             g.strokePath (dashed, juce::PathStrokeType (1.6f));
         }
 
+        /** 拖动插件卡片：落到通道卡片上时高亮目标（卡片本体已随鼠标移动，不再画虚影）。 */
+        void drawPlugDragGhost (juce::Graphics& g)
+        {
+            if (! dragging_ || dragging_->kind != DragNode::Plug) return;
+            const int dst = channelAt (mousePos_);
+            if (dst >= 0 && ! layout_.chCards.empty())
+            {
+                const auto hi = layout_.chCards[static_cast<size_t> (dst)];
+                g.setColour (mb::ui::accent[0].withAlpha (0.22f));
+                g.fillRoundedRectangle (hi, 5.0f);
+                g.setColour (mb::ui::accent[0].withAlpha (0.9f));
+                g.drawRoundedRectangle (hi, 5.0f, 1.6f);
+            }
+        }
+
         //======================================================================
         // 命中测试
         //======================================================================
@@ -1166,23 +1348,30 @@ namespace mb
         {
             std::optional<Anchor> best;
             float bestDist = 1.0e9f;
+            auto considerOne = [&] (const Anchor& d)
+            {
+                if (d.hidden) return;
+                const float dist = d.pos.getDistanceFrom (p);
+                if (dist < dotHitRadius (d) && dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = d;
+                }
+            };
             auto consider = [&] (const std::vector<Anchor>& v)
             {
-                for (const auto& d : v)
-                {
-                    if (d.hidden) continue;
-                    const float dist = d.pos.getDistanceFrom (p);
-                    if (dist < dotHitRadius (d) && dist < bestDist)
-                    {
-                        bestDist = dist;
-                        best = d;
-                    }
-                }
+                for (const auto& d : v) considerOne (d);
             };
             consider (layout_.inDots);
             consider (layout_.outDots);
             consider (layout_.chInL);    consider (layout_.chInR);
             consider (layout_.chOutL);   consider (layout_.chOutR);
+            // 插件卡片四个点
+            for (const auto& pc : layout_.plugCards)
+            {
+                considerOne (pc.inL);  considerOne (pc.inR);
+                considerOne (pc.outL); considerOne (pc.outR);
+            }
             return best;
         }
 
@@ -1226,6 +1415,26 @@ namespace mb
         //======================================================================
         // 自由画布：节点命中 / 偏移 / 吸附 / 空白画布菜单
         //======================================================================
+        /** 命中插件卡片本体（倒序：后画的在上层）。 */
+        const PlugCard* pluginCardAt (const juce::Point<float>& p) const
+        {
+            for (int i = static_cast<int> (layout_.plugCards.size()) - 1; i >= 0; --i)
+                if (layout_.plugCards[static_cast<size_t> (i)].rect.contains (p))
+                    return &layout_.plugCards[static_cast<size_t> (i)];
+            return nullptr;
+        }
+
+        /** 鼠标是否落在任意卡片（通道 / 端口 / 插件）上。连线命中与悬停提示据此跳过，
+            避免连线穿过卡片时误弹「移除连接」菜单或连接名。 */
+        bool overAnyCard (const juce::Point<float>& p) const
+        {
+            if (pluginCardAt (p) != nullptr) return true;
+            for (const auto& r : layout_.chCards) if (r.contains (p)) return true;
+            for (const auto& r : layout_.inCards) if (r.contains (p)) return true;
+            for (const auto& r : layout_.outCards) if (r.contains (p)) return true;
+            return false;
+        }
+
         std::optional<DragNode> nodeBodyAt (const juce::Point<float>& p) const
         {
             for (int c = 0; c < graph_.channelCount(); ++c)
@@ -1276,7 +1485,7 @@ namespace mb
         juce::Rectangle<float> monoRectFor (int c) const   // 声道制式徽标热区
         {
             const auto card = layout_.chCards[static_cast<size_t> (c)];
-            return { card.getRight() - 60.0f, card.getY() + 5.0f, 16.0f, 17.0f };
+            return { card.getRight() - 28.0f, card.getY() + 5.0f, 18.0f, 17.0f };
         }
 
         juce::Rectangle<float> bodyRectFor (int c) const
@@ -1325,6 +1534,15 @@ namespace mb
         public:
         // 自由画布布局持久化：与 SessionStore 对接（session.json 的 nodeLayout 字段）
         //======================================================================
+        /** 新增自由插件后由 MainComponent 调用：给该 UID 指定初始画布位置。 */
+        void setPluginPosition (const juce::String& uid, const juce::Point<float>& pos)
+        {
+            if (uid.isEmpty()) return;
+            plugPos_[uid] = pos;
+            updateSize();
+            repaint();
+        }
+
         juce::var layoutToJson() const
         {
             auto* o = new juce::DynamicObject();
@@ -1337,6 +1555,14 @@ namespace mb
             o->setProperty ("ch",  pack (chOff_));
             o->setProperty ("in",  pack (inOff_));
             o->setProperty ("out", pack (outOff_));
+            auto* po = new juce::DynamicObject();
+            for (const auto& kv : plugPos_)
+            {
+                juce::Array<juce::var> a;
+                a.add (kv.second.x); a.add (kv.second.y);
+                po->setProperty (kv.first, juce::var (a));
+            }
+            o->setProperty ("plugPos", juce::var (po));
             return juce::var (o);
         }
 
@@ -1360,7 +1586,225 @@ namespace mb
             unpack (o->getProperty ("ch"),  chOff_);
             unpack (o->getProperty ("in"),  inOff_);
             unpack (o->getProperty ("out"), outOff_);
+            plugPos_.clear();
+            if (auto* po = o->getProperty ("plugPos").getDynamicObject())
+                for (auto& kv : po->getProperties())
+                {
+                    const auto& a = kv.value;
+                    if (a.isArray() && a.getArray()->size() >= 2)
+                        plugPos_[kv.name.toString()] = {
+                            static_cast<float> (static_cast<double> (a.getArray()->getUnchecked (0))),
+                            static_cast<float> (static_cast<double> (a.getArray()->getUnchecked (1))) };
+                }
             updateSize();
+        }
+
+        //======================================================================
+        // 右键菜单：空白画布 / 通道卡片 / 插件卡片 / 插件圆点
+        //======================================================================
+        /** 空白区右键：新增通道 / 在光标处新增自由插件（多选，无需先选通道）。 */
+        void showCanvasContextMenu (const juce::Point<float>& p)
+        {
+            juce::PopupMenu m;
+            m.addSectionHeader (mb::tr ("节点视图", "Node view"));
+            const bool canAddCh = graph_.channelCount() < 16;
+            m.addItem (1, mb::S("+ ") + mb::tr ("通道", "Channel"), canAddCh);
+            m.addItem (2, mb::S("+ ") + mb::tr ("插件", "Plugin"));
+
+            juce::Component::SafePointer<NodeCanvas> safe (this);
+            m.showMenuAsync (menuOptions (p), [safe, p] (int r)
+            {
+                if (safe == nullptr) return;
+                if (r == 1) { if (safe->onAddChannel) safe->onAddChannel(); return; }
+                if (r == 2 && safe->onAddFreePlugins) safe->onAddFreePlugins (p);
+            });
+        }
+
+        /** 通道卡片右键：与经典视图「电平 / 通用区右键」菜单逐项一致。 */
+        void showChannelContextMenu (int ch, const juce::Point<float>& p)
+        {
+            juce::PopupMenu m;
+            m.addSectionHeader (mb::S("CH") + juce::String (ch + 1) + mb::S("  ")
+                                + mb::channelDisplayName (ch));
+            m.addItem (1, mb::tr ("复制通道", "Duplicate channel"));
+            const bool right = mb::ui::isChannelRightAligned (ch);
+            m.addItem (2, right ? mb::tr ("取消向右对齐", "Remove right alignment")
+                                : mb::tr ("向右对齐", "Align right"), true, right);
+            m.addSeparator();
+
+            // 移除连接…：所有进入 / 离开本通道的边（经典视图同款）
+            auto ctxEdges = std::make_shared<std::vector<mb::RouteEdge>>();
+            for (const auto& e : graph_.edges())
+                if (e.src == ch || e.dst == ch) ctxEdges->push_back (e);
+            if (! ctxEdges->empty())
+            {
+                juce::PopupMenu rm;
+                int id = 100;
+                for (const auto& e : *ctxEdges)
+                    rm.addItem (id++, mb::tr ("移除  ", "Remove  ") + linkLabel (e));
+                m.addSubMenu (mb::tr ("移除连接…", "Remove connection…"), rm, true);
+            }
+
+            m.addItem (3, mb::tr ("颜色与图标…", "Colour & icon…"));
+            m.addSeparator();
+            m.addItem (4, mb::tr ("快捷键与链接…", "Hotkeys & links…"));
+            m.addSeparator();
+            m.addItem (5, mb::tr ("重命名通道", "Rename channel"));
+            m.addItem (6, mb::tr ("隐藏通道", "Hide channel"));
+
+            juce::PopupMenu reveal;
+            int hidden = 0;
+            for (int c = 0; c < graph_.channelCount(); ++c)
+                if (mb::ui::slotState (c) == mb::ui::kSlotHidden)
+                {
+                    reveal.addItem (200 + c, mb::S("CH") + juce::String (c + 1)
+                        + mb::S("  ·  ") + mb::channelDisplayName (c));
+                    ++hidden;
+                }
+            if (hidden > 0)
+            {
+                reveal.addSeparator();
+                reveal.addItem (199, mb::tr ("显示全部通道", "Show all channels"));
+                m.addSubMenu (mb::tr ("显示已隐藏通道", "Show hidden channels"), reveal, true);
+            }
+            else
+                m.addItem (199, mb::tr ("显示全部通道", "Show all channels"), false);
+
+            m.addSeparator();
+            m.addItem (7, mb::tr ("删除通道", "Delete channel"));
+
+            juce::Component::SafePointer<NodeCanvas> safe (this);
+            m.showMenuAsync (menuOptions (p),
+                [safe, ch, ctxEdges, right] (int r)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+                    if (r == 1)      { if (self->onDuplicateChannel) self->onDuplicateChannel (ch); return; }
+                    if (r == 2)      { if (self->onSetRightAligned) self->onSetRightAligned (ch, ! right); return; }
+                    if (r == 3)      { if (self->onPickColour) self->onPickColour (ch); return; }
+                    if (r == 4)      { if (self->onLinkChannel) self->onLinkChannel (ch); return; }
+                    if (r == 5)      { self->beginRename (ch); return; }
+                    if (r == 6)      { if (self->onSetHidden) self->onSetHidden (ch, true); return; }
+                    if (r == 199)    { if (self->onShowAllChannels) self->onShowAllChannels(); return; }
+                    if (r >= 200 && r < 200 + 32)
+                    {
+                        if (self->onSetHidden) self->onSetHidden (r - 200, false);
+                        return;
+                    }
+                    if (r >= 100 && r - 100 < static_cast<int> (ctxEdges->size()))
+                    {
+                        const auto& e = (*ctxEdges)[static_cast<size_t> (r - 100)];
+                        self->graph_.removeEdge (e.src, e.dst, e.kind);
+                        if (self->onChanged) self->onChanged();
+                        if (self->onMessage) self->onMessage (mb::tr ("已移除连接", "Connection removed"));
+                        self->repaint();
+                    }
+                    if (r == 7 && self->onDeleteChannel) self->onDeleteChannel (ch);
+                });
+        }
+
+        /** 插件卡片右键：与经典视图「插件行右键」逐项一致。
+            顺序：旁通 → 离线 → 打开界面 → 重命名 → 快捷键与链接 → 查看目录 → 删除。 */
+        void showPluginContextMenu (const PlugCard& pc, const juce::Point<float>& p)
+        {
+            const int bc = pc.ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : pc.ch;
+            const auto& bank = engine_.pluginBank();
+            const auto name = bank.pluginName (bc, pc.idx);
+            const bool bypass = bank.pluginBypass (bc, pc.idx);
+            const bool offline = bank.pluginOffline (bc, pc.idx);
+            const bool builtIn = bank.pluginBuiltInId (bc, pc.idx) > 0;
+            const auto note = bank.pluginNote (bc, pc.idx);
+            const auto ident = bank.pluginIdentifier (bc, pc.idx);
+
+            juce::PopupMenu m;
+            m.addSectionHeader (note.isEmpty() ? name : note + mb::S(" (") + name + mb::S(")"));
+            m.addItem (1, bypass ? mb::tr ("启用插件", "Enable plugin")
+                                 : mb::tr ("旁通插件", "Bypass plugin"));
+            m.addItem (2, offline ? mb::tr ("取消离线", "Bring online")
+                                  : mb::tr ("离线插件", "Take offline"), ! builtIn);
+            m.addItem (3, mb::tr ("打开插件界面", "Open editor window"), ! offline);
+            m.addItem (4, mb::tr ("重命名", "Rename"));
+            m.addItem (5, mb::tr ("快捷键与链接", "Hotkey & link"));
+            m.addItem (6, mb::tr ("查看目录", "Reveal in folder"), ! builtIn);
+            m.addSeparator();
+            m.addItem (7, mb::tr ("删除插件", "Remove plugin"));
+
+            juce::Component::SafePointer<NodeCanvas> safe (this);
+            m.showMenuAsync (menuOptions (p),
+                [safe, ch = pc.ch, idx = pc.idx, ident] (int r)
+                {
+                    auto* self = safe.getComponent();
+                    if (self == nullptr) return;
+                    if (r == 6)
+                    {
+                        const juce::File f (ident);
+                        if (f.existsAsFile())           f.revealToUser();
+                        else if (f.isDirectory())       f.startAsProcess();
+                        else if (self->onMessage) self->onMessage (
+                            mb::tr ("插件文件不存在", "Plugin file not found"));
+                        return;
+                    }
+                    if (r == 1 && self->onPluginBypass)      { self->onPluginBypass (ch, idx); return; }
+                    if (r == 2 && self->onPluginOffline)     { self->onPluginOffline (ch, idx); return; }
+                    if (r == 3 && self->onOpenPlugin)        { self->onOpenPlugin (ch, idx); return; }
+                    if (r == 4)
+                    {
+                        // 弹输入框重命名（与经典视图「重命名插件」一致），确认后写备注
+                        const int bc = ch < 0 ? mb::ChannelPluginBank::kFreePluginSlot : ch;
+                        auto& bank = self->engine_.pluginBank();
+                        auto* aw = new juce::AlertWindow (
+                            mb::tr ("重命名插件", "Rename plugin"), bank.pluginName (bc, idx),
+                            juce::MessageBoxIconType::NoIcon);
+                        aw->addTextEditor ("note", bank.pluginNote (bc, idx),
+                                           mb::tr ("新名称（显示为「名称 (插件名)」，清空即恢复原名）",
+                                                   "New name (shown as \"name (plugin)\"; empty = original)"));
+                        aw->addButton (mb::tr ("保存", "Save"),   1);
+                        aw->addButton (mb::tr ("取消", "Cancel"), 0);
+                        aw->enterModalState (true,
+                            juce::ModalCallbackFunction::create ([safe, ch, idx, aw] (int r2)
+                            {
+                                if (r2 == 1 && safe != nullptr && safe->onRenamePlugin)
+                                    if (auto* ed = aw->getTextEditor ("note"))
+                                        safe->onRenamePlugin (ch, idx, ed->getText());
+                            }),
+                            true);
+                        return;
+                    }
+                    if (r == 5 && self->onPluginLink)
+                    {
+                        // 插件入口 = 控制整条效果链，默认预选「效果」动作
+                        self->onPluginLink (ch < 0 ? 0 : ch, mb::links::kFx);
+                        return;
+                    }
+                    if (r == 7 && self->onRemovePlugin)      { self->onRemovePlugin (ch, idx); return; }
+                });
+        }
+
+        /** 点击插件输入/输出圆点：只断开与通道的连接，插件卡片保留在画布上。
+            真正删除插件在插件卡片右键菜单里。 */
+        void showPlugDotMenu (const Anchor& a, const juce::Point<float>& p)
+        {
+            const auto& bank = engine_.pluginBank();
+            const int bc = a.id < 0 ? mb::ChannelPluginBank::kFreePluginSlot : a.id;
+            if (a.plugIdx < 0 || a.plugIdx >= bank.pluginCount (bc)) return;
+            const auto name = bank.pluginName (bc, a.plugIdx);
+
+            juce::PopupMenu m;
+            m.addSectionHeader (a.id < 0
+                ? name
+                : mb::S("CH") + juce::String (a.id + 1) + mb::S("  ") + name);
+            if (a.id < 0)
+                m.addItem (-1, mb::tr ("该插件尚未连接通道", "Plugin is not connected"), false);
+            else
+                m.addItem (1, mb::tr ("断开连接（保留插件）", "Disconnect (keep plugin)"));
+
+            juce::Component::SafePointer<NodeCanvas> safe (this);
+            m.showMenuAsync (menuOptions (p), [safe, bc, idx = a.plugIdx] (int r)
+            {
+                if (safe == nullptr || r != 1 || ! safe->onMovePlugin) return;
+                safe->onMovePlugin (bc, idx, mb::ChannelPluginBank::kFreePluginSlot, -1);
+                if (safe->onMessage) safe->onMessage (mb::tr ("已断开插件连接", "Plugin disconnected"));
+            });
         }
 
         //======================================================================
@@ -1486,8 +1930,8 @@ namespace mb
             addAndMakeVisible (nameEditor_.get());
 
             const auto card = layout_.chCards[static_cast<size_t> (c)].toNearestInt();
-            nameEditor_->setBounds (card.getX() + 50, card.getY() + 4,
-                                    card.getWidth() - 110, kChHeadH - 8);
+            nameEditor_->setBounds (card.getX() + 28, card.getY() + 4,
+                                    juce::jmax (40, card.getWidth() - 68), kChHeadH - 8);
             nameEditor_->grabKeyboardFocus();
         }
 
@@ -1541,8 +1985,97 @@ namespace mb
             return -1;
         }
 
+        /** 插件卡片连线：PlugOut→PlugIn 表达顺序（同通道重排）/ 改归属（跨通道）；
+            PlugOut→通道输入点 = 改归属到该通道。
+            明确禁止插件点连接设备端口（InPort/OutPort）——插件是通道内部处理链，
+            不是独立音源/汇，接设备没有音频语义。 */
+        bool makePlugLink (const Anchor& a, const Anchor& b)
+        {
+            auto isPlug = [] (Anchor::Kind k) { return k == Anchor::PlugIn || k == Anchor::PlugOut; };
+            auto bankCh = [] (int id) { return id < 0 ? mb::ChannelPluginBank::kFreePluginSlot : id; };
+            // 插件点 ↔ 设备端口：禁用
+            if ((isPlug (a.kind) && (b.kind == Anchor::InPort || b.kind == Anchor::OutPort))
+                || (isPlug (b.kind) && (a.kind == Anchor::InPort || a.kind == Anchor::OutPort)))
+            {
+                if (onMessage) onMessage (mb::tr ("插件不能直连设备端口", "Plugins cannot connect to device ports"));
+                return false;
+            }
+
+            // 归一化：确保 out 端在前、in 端在后（支持反向拖拽）
+            Anchor out, in;
+            bool pluginToCh = false;
+            int targetCh = -1;
+            if (a.kind == Anchor::PlugOut && b.kind == Anchor::PlugIn)       { out = a; in = b; }
+            else if (a.kind == Anchor::PlugIn && b.kind == Anchor::PlugOut)  { out = b; in = a; }
+            else if (a.kind == Anchor::PlugOut && (b.kind == Anchor::ChIn || b.kind == Anchor::ChOut))
+            { out = a; pluginToCh = true; targetCh = b.id; }
+            else if (b.kind == Anchor::PlugOut && (a.kind == Anchor::ChIn || a.kind == Anchor::ChOut))
+            { out = b; pluginToCh = true; targetCh = a.id; }
+            else
+            {
+                if (onMessage) onMessage (mb::tr ("该方向不支持连接", "Unsupported connection direction"));
+                return false;
+            }
+
+            const int src = bankCh (out.id);
+            auto& bank = engine_.pluginBank();
+            if (pluginToCh)
+            {
+                // 插件 → 通道输入点：建立归属连接（自由插件 / 其他通道均可）
+                if (src == targetCh) return false;
+                if (onMovePlugin) onMovePlugin (src, out.plugIdx, targetCh, -1);
+                else if (bank.movePlugin (src, out.plugIdx, targetCh) < 0) return false;
+                if (onMessage) onMessage (mb::tr ("已连接插件到 ", "Plugin connected to ")
+                    + mb::channelDisplayName (targetCh));
+                if (onChanged) onChanged();
+                return true;
+            }
+
+            const int dst = bankCh (in.id);
+            const int targetIdx = in.plugIdx;      // 插到目标插件之前 = 排在它前面
+            if (src == dst && out.plugIdx == targetIdx) return false;
+
+            // 同通道内重排：同步交换两张卡片的画布位置，视觉顺序 = 处理顺序
+            if (src == dst)
+            {
+                const auto ua = bank.pluginUid (src, out.plugIdx);
+                const auto ub = bank.pluginUid (dst, targetIdx);
+                if (ua.isNotEmpty() && ub.isNotEmpty())
+                    std::swap (plugPos_[ua], plugPos_[ub]);
+                if (onMovePlugin) onMovePlugin (src, out.plugIdx, dst, targetIdx);
+                else if (! bank.reorderPlugin (src, out.plugIdx, targetIdx))
+                {
+                    if (ua.isNotEmpty() && ub.isNotEmpty()) std::swap (plugPos_[ua], plugPos_[ub]);
+                    return false;
+                }
+                if (onMessage) onMessage (mb::tr ("已调整插件顺序", "Plugin order changed"));
+                if (onChanged) onChanged();
+                return true;
+            }
+
+            // 跨通道 / 自由插件之间：移动并按落点插入
+            if (onMovePlugin) onMovePlugin (src, out.plugIdx, dst, targetIdx);
+            else
+            {
+                const int ni = bank.movePlugin (src, out.plugIdx, dst);
+                if (ni < 0) return false;
+                if (targetIdx >= 0) bank.reorderPlugin (dst, ni, targetIdx);
+            }
+            if (onMessage) onMessage (mb::tr ("已移动插件到 ", "Plugin moved to ")
+                + (dst == mb::ChannelPluginBank::kFreePluginSlot
+                   ? mb::tr ("未连接区", "Unconnected")
+                   : mb::channelDisplayName (dst)));
+            if (onChanged) onChanged();
+            return true;
+        }
+
         bool makeEdge (const Anchor& a, const Anchor& b)
         {
+            // —— 插件卡片连接：不产生 RouteEdge，纯表达「顺序 / 归属」——
+            if (a.kind == Anchor::PlugIn || a.kind == Anchor::PlugOut
+                || b.kind == Anchor::PlugIn || b.kind == Anchor::PlugOut)
+                return makePlugLink (a, b);
+
             mb::RouteEdge e { -1, -1, mb::EdgeKind::InputToChannel, 1.0f };
             bool valid = false;
             int portId = -1;                 // 端口端 id（C→C 时为 -1）
@@ -1635,5 +2168,85 @@ namespace mb
         }
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NodeCanvas)
+    };
+
+    //==============================================================================
+    /** 节点视图顶部固定工具栏：吸附开关 / 重置布局。
+        作为 MainComponent 的覆盖层浮在 nodeViewport_ 之上，不随画布内容滚动。 */
+    //==============================================================================
+    class NodeToolbar : public juce::Component
+    {
+    public:
+        NodeToolbar() = default;
+
+        std::function<void()> onToggleSnap;
+        std::function<void()> onResetLayout;
+        std::function<bool()> getSnap;
+
+        void paint (juce::Graphics& g) override
+        {
+            const float w = static_cast<float> (getWidth());
+            const float h = static_cast<float> (getHeight());
+            g.setColour (mb::ui::topBar.withAlpha (0.96f));
+            g.fillRect (0.0f, 0.0f, w, h);
+            g.setColour (mb::ui::border.withAlpha (0.85f));
+            g.drawHorizontalLine (h - 1.0f, 0.0f, w);
+
+            const bool snap = (getSnap != nullptr) && getSnap();
+            drawButton (g, snapRect(), snap
+                ? mb::tr ("吸附 开", "Snap on") : mb::tr ("吸附 关", "Snap off"), snap);
+            drawButton (g, resetRect(), mb::tr ("重置布局", "Reset layout"), false);
+        }
+
+        void mouseMove (const juce::MouseEvent& ev) override
+        {
+            lastMouse_ = ev.position;
+            const bool s = snapRect().contains (ev.position);
+            const bool r = resetRect().contains (ev.position);
+            if (s != hotSnap_ || r != hotReset_)
+            {
+                hotSnap_ = s; hotReset_ = r; repaint();
+            }
+            setMouseCursor ((s || r) ? juce::MouseCursor::PointingHandCursor
+                                     : juce::MouseCursor::NormalCursor);
+        }
+
+        void mouseExit (const juce::MouseEvent&) override
+        {
+            if (hotSnap_ || hotReset_) { hotSnap_ = hotReset_ = false; repaint(); }
+            setMouseCursor (juce::MouseCursor::NormalCursor);
+        }
+
+        void mouseDown (const juce::MouseEvent& ev) override
+        {
+            if (snapRect().contains (ev.position))   { if (onToggleSnap) onToggleSnap(); return; }
+            if (resetRect().contains (ev.position))  { if (onResetLayout) onResetLayout(); return; }
+        }
+
+    private:
+        bool hotSnap_ = false, hotReset_ = false;
+
+        juce::Rectangle<float> snapRect() const
+            { return { static_cast<float> (getWidth()) - 142.0f, 6.0f, 64.0f, 18.0f }; }
+        juce::Rectangle<float> resetRect() const
+            { return { static_cast<float> (getWidth()) - 72.0f, 6.0f, 60.0f, 18.0f }; }
+
+        void drawButton (juce::Graphics& g, const juce::Rectangle<float>& r,
+                         const juce::String& text, bool lit)
+        {
+            const bool hot = r.contains (lastMouse_);
+            g.setColour ((lit ? mb::ui::accent[0].withAlpha (0.20f)
+                              : mb::ui::card.withAlpha (hot ? 0.95f : 0.72f)));
+            g.fillRoundedRectangle (r, 4.0f);
+            g.setColour ((lit ? mb::ui::accent[0] : mb::ui::border).withAlpha (hot ? 0.9f : 0.6f));
+            g.drawRoundedRectangle (r, 4.0f, 0.8f);
+            g.setFont (mb::ui::font (8.5f, lit));
+            g.setColour (lit ? mb::ui::accent[0].brighter (0.2f) : mb::ui::subText);
+            g.drawText (text, r.toNearestInt(), juce::Justification::centred, false);
+        }
+
+        juce::Point<float> lastMouse_ { -1000.0f, -1000.0f };
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NodeToolbar)
     };
 }

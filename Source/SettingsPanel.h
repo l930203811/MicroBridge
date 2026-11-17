@@ -19,6 +19,13 @@
 // 新增常用选项：开机自启、启动后隐藏到托盘、关闭时隐藏到托盘、通道边框样式。
 // 所有改动即时写盘，由 MainComponent 负责应用到运行时（注册表 / 托盘 / 重绘）。
 //==============================================================================
+//==============================================================================
+// 设置页卡片宽度下限 = 720，加左右各 30 边距 → 主窗口小于 780 时卡片被裁剪。
+// MainComponent::showSettings 据此在通道少、窗口变窄时临时撑宽窗口，
+// closeSettings 再按通道数收回（refreshWindowWidth）。
+//==============================================================================
+inline constexpr int kSettingsCardMinWindowWidth = 780;
+
 class SettingsPanel : public juce::Component
 {
 public:
@@ -85,7 +92,9 @@ public:
         styleButton (hotkeyBtn_);
         styleButton (unlockHotkeyBtn_);
         styleButton (lightTheme_);          // 深浅模式：切换按钮（与抽屉入口同步）
-        for (int i = 0; i < kTabCount; ++i)  // 分类 Tab：常规 / 界面 / 录音 / 设备设置 / 插件库 / 其他 / 快捷键
+        styleButton (repoBtn_);             // 关于：打开仓库主页
+        styleButton (copyRepoBtn_);         // 关于：复制仓库链接
+        for (int i = 0; i < kTabCount; ++i)  // 分类 Tab：常规 / 界面 / 录音 / 设备设置 / 插件库 / 其他 / 快捷键 / 关于
         {
             styleButton (tabBtns_[i]);
             tabBtns_[i].onClick = [this, i] { setTab (i); };
@@ -211,6 +220,14 @@ public:
         };
         newInstanceBtn_.onClick = [this] { if (onLaunchNewInstance) onLaunchNewInstance(); };
         restartBtn_.onClick     = [this] { if (onRestartApp) onRestartApp(); };
+        repoBtn_.onClick = []
+        {
+            juce::URL (mb::kRepoUrl).launchInDefaultBrowser();
+        };
+        copyRepoBtn_.onClick = []
+        {
+            juce::SystemClipboard::copyTextToClipboard (mb::S (mb::kRepoUrl));
+        };
         openDirBtn_.onClick = [this]
         {
             const auto d = recordDirectory();
@@ -244,6 +261,7 @@ public:
         tabBtns_[4].setButtonText (mb::tr ("插件库", "Plugins"));
         tabBtns_[5].setButtonText (mb::tr ("快捷键", "Hotkeys"));
         tabBtns_[6].setButtonText (mb::tr ("其他", "Other"));
+        tabBtns_[7].setButtonText (mb::tr ("关于", "About"));
         refreshHotkeyText();
         autoStart_.setButtonText (mb::tr ("开机自动启动", "Launch at Windows startup"));
         startTray_.setButtonText (mb::tr ("启动后隐藏到托盘", "Start minimized to tray"));
@@ -272,6 +290,8 @@ public:
         openDirBtn_.setButtonText (mb::tr ("打开目录", "Open folder"));
         newInstanceBtn_.setButtonText (mb::tr ("启动新实例", "New instance"));
         restartBtn_.setButtonText     (mb::tr ("重启应用", "Restart app"));
+        repoBtn_.setButtonText      (mb::tr ("打开仓库主页", "Open repository"));
+        copyRepoBtn_.setButtonText  (mb::tr ("复制链接", "Copy link"));
         restartBtn_.setTooltip (mb::tr ("保存会话后关闭当前实例并重新打开",
                                         "Save session, quit and relaunch"));
         newInstanceBtn_.setTooltip (mb::tr ("以新进程再启动一份应用（互斥保护不受影响）",
@@ -365,7 +385,7 @@ public:
 
         // 普通页内容面板：与内嵌页（插件库 / 设备设置）一致的「面板底色 + 描边线条」
         if (activeTab_ == 0 || activeTab_ == 1 || activeTab_ == 2
-            || activeTab_ == 5 || activeTab_ == 6)
+            || activeTab_ == 5 || activeTab_ == 6 || activeTab_ == 7)
         {
             const auto panel = juce::Rectangle<float> (static_cast<float> (c.getX() + 100),
                                                        static_cast<float> (c.getY() + 88),
@@ -562,6 +582,49 @@ public:
             fNote  (x3, py + 78, colW, "保存会话后关闭并重新打开", "Save session, quit and relaunch");
             break;
         }
+        case 7:                             // 关于
+        {
+            const int cw = c.getRight() - 16 - cx;
+            // 应用名 + 版本（版本号与安装包脚本共用 mb::kAppVersion 一处定义）
+            g.setFont (mb::ui::font (14.0f, true));
+            g.setColour (mb::ui::text);
+            g.drawText (mb::S("微音桥 · MicroBridge"), cx, py + 24, cw, 22,
+                        juce::Justification::centredLeft, false);
+            g.setFont (mb::ui::font (10.5f));
+            g.setColour (mb::ui::accent[0]);
+            g.drawText (mb::tr ("版本 v", "Version v") + juce::String (mb::kAppVersion),
+                        cx, py + 50, cw, 18, juce::Justification::centredLeft, false);
+            g.setFont (mb::ui::font (9.5f));
+            g.setColour (mb::ui::subText);
+            g.drawText (mb::tr ("Windows 轻量音频路由机架 —— 软件配线架",
+                                "Lightweight audio routing rack for Windows — a software patch bay"),
+                        cx, py + 74, cw, 16, juce::Justification::centredLeft, false);
+
+            // 仓库地址
+            g.setFont (mb::ui::font (9.0f, true));
+            g.drawText (mb::tr ("项目仓库", "Repository"),
+                        cx, py + 118, cw, 16, juce::Justification::centredLeft, false);
+            g.setFont (mb::ui::font (9.5f));
+            g.drawText (mb::S (mb::kRepoUrl),
+                        cx, py + 138, cw, 16, juce::Justification::centredLeft, false);
+
+            // 说明（自动换行，不越出面板边框）
+            juce::AttributedString note (mb::tr (
+                "获取新版本请到仓库 Releases 页下载；使用中遇到问题或想要新功能，欢迎到 Issues 提交反馈。",
+                "Grab new builds from the repository's Releases page; for bugs and feature requests, "
+                "please open an issue."));
+            note.setFont (mb::ui::font (9.0f));
+            note.setColour (mb::ui::subText);
+            note.setWordWrap (mb::isZh() ? juce::AttributedString::byChar
+                                         : juce::AttributedString::byWord);
+            note.setJustification (juce::Justification::topLeft);
+            const auto noteArea = juce::Rectangle<int> (cx, py + 172, cw - 20, 34);
+            g.saveState();
+            g.reduceClipRegion (noteArea);
+            note.draw (g, noteArea.toFloat());
+            g.restoreState();
+            break;
+        }
         }
 
         // 激活 Tab 的强调色侧条（纵向 Tab：条画在按钮左缘）
@@ -619,6 +682,10 @@ public:
         newInstanceBtn_.setBounds (x + colW3 + 24,      py + 42, colW3, 30);
         restartBtn_.setBounds     (x + 2 * (colW3 + 24),py + 42, colW3, 30);
 
+        // 关于 Tab：仓库主页 + 复制链接 两列一行（与 paint 的 URL 行对齐）
+        repoBtn_.setBounds     (x,               py + 214, colW3,     30);
+        copyRepoBtn_.setBounds (x + colW3 + 24,  py + 214, colW3,     30);
+
         // 快捷键 Tab：左列上下两条录入按钮，右列两个隐藏方式单选
         hotkeyBtn_.setBounds       (x,   py + 44,  colW2, 30);
         unlockHotkeyBtn_.setBounds (x,   py + 110, colW2, 30);
@@ -633,7 +700,7 @@ public:
         const bool t0 = activeTab_ == 0, t1 = activeTab_ == 1,
                    t2 = activeTab_ == 2, t3 = activeTab_ == 3,
                    t4 = activeTab_ == 4, t5 = activeTab_ == 5,
-                   t6 = activeTab_ == 6;
+                   t6 = activeTab_ == 6, t7 = activeTab_ == 7;
         autoStart_.setVisible (t0);
         startTray_.setVisible (t0);
         closeTray_.setVisible (t0);
@@ -661,6 +728,8 @@ public:
         unlockHotkeyBtn_.setVisible (t5);
         hideTrayMode_.setVisible (t5);
         hideFullMode_.setVisible (t5);
+        repoBtn_.setVisible (t7);               // 关于：仓库主页 / 复制链接
+        copyRepoBtn_.setVisible (t7);
     }
 
     void setTab (int i)
@@ -722,6 +791,7 @@ public:
             styleToggleColour (*b);
         for (auto* b : { &langBtn_, &diagBtn_, &dirBtn_,
                          &openDirBtn_, &closeBtn_, &applyDeviceBtn_, &newInstanceBtn_, &restartBtn_,
+                         &repoBtn_, &copyRepoBtn_,
                          &hotkeyBtn_, &unlockHotkeyBtn_, &lightTheme_ })
             styleButtonColour (*b);
         refreshTabStyles();
@@ -732,7 +802,7 @@ public:
     }
 
 private:
-    static constexpr int kTabCount = 7;             // Tab 总数（数组与所有循环共用，避免越界）
+    static constexpr int kTabCount = 8;             // Tab 总数（数组与所有循环共用，避免越界）
     static constexpr int tabPageY() { return 98; }   // Tab 内容统一起始 y（Tab 栏下方）
     static constexpr int kTabW = 84;                 // 纵向 Tab 栏宽
 
@@ -799,6 +869,7 @@ private:
     juce::TextButton langBtn_, diagBtn_, dirBtn_, openDirBtn_, closeBtn_;
     juce::TextButton applyDeviceBtn_;                 // 设备设置 Tab 的页脚「应用」
     juce::TextButton newInstanceBtn_, restartBtn_;   // 「其他」区按钮行
+    juce::TextButton repoBtn_, copyRepoBtn_;         // 「关于」区按钮行（打开仓库 / 复制链接）
     juce::ComboBox fmtCombo_, bitsCombo_, srCombo_, modeCombo_, scaleCombo_;
     juce::TextButton hotkeyBtn_;                      // 全局隐藏/恢复快捷键录入按钮
     juce::TextButton unlockHotkeyBtn_;                // 锁定/解锁桌面歌词切换快捷键录入按钮

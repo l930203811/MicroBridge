@@ -90,6 +90,8 @@ target_sources(MicroBridgeApp PRIVATE
     Source/DiagnosticsPanel.h
     Source/I18n.h
     Source/SourcePicker.h
+    Source/PresetSwitcherOverlay.h
+    Source/BuiltinDefaultPreset.h
     Source/Theme.h
     Source/RouteGraph.h
     Source/MFAudioFormat.h

@@ -10,9 +10,9 @@
 ;
 ; 编译：用 Inno Setup 6 打开本脚本 → Compile；或命令行：
 ;   ISCC.exe installer\MicroBridge.iss
-; 产物：installer\Output\MicroBridgeSetup-0.1.0.exe
+; 输出：installer\Output\微音桥·MicroBridge v{#MyAppVersion}.exe（发布时压缩为同名 .zip）
 
-#define MyAppName      "MicroBridge 微音桥"
+#define MyAppName      "微音桥·MicroBridge"
 #define MyAppVersion   "0.1.0"
 #define MyAppPublisher "MicroBridge"
 #define MyAppExeName   "MicroBridge.exe"
@@ -38,26 +38,30 @@ CloseApplications=yes
 RestartApplications=no
 ; 输出
 OutputDir=Output
-OutputBaseFilename=MicroBridgeSetup-{#MyAppVersion}
+OutputBaseFilename=微音桥·MicroBridge v{#MyAppVersion}
 SetupIconFile=..\Assets\Icons\MicroBridge.ico
-UninstallDisplayIcon={app}\{#MyAppExeName}
+; 卸载列表图标直接指向 ico 文件（指 exe 时 Windows 常缓存成通用图标）
+UninstallDisplayIcon={app}\MicroBridge.ico
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesInstallIn64BitMode=x64os
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
+; 官方版 Inno Setup：Default.isl = 英文，简中在 Languages\ChineseSimplified.isl。
+Name: "english";            MessagesFile: "compiler:Default.isl"
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Files]
-; 只装主程序；MicroBridgeData 由程序首次运行自行创建，绝不覆盖用户配置
+; 主程序 + 图标文件（图标供卸载列表 DisplayIcon 用）；
+; MicroBridgeData 由程序首次运行自行创建，绝不覆盖用户配置
 Source: "..\build\MicroBridgeApp_artefacts\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Assets\Icons\MicroBridge.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "微音桥 - 软件配线架"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\MicroBridge.ico"; Comment: "微音桥 - 软件配线架"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "微音桥 - 软件配线架"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\MicroBridge.ico"; Comment: "微音桥 - 软件配线架"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 MicroBridge / Launch MicroBridge"; Flags: nowait postinstall skipifsilent
@@ -65,9 +69,3 @@ Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 MicroBridge / Laun
 ; 说明：Inno Setup 卸载只删除 [Files] 安装的文件（MicroBridge.exe），
 ; 程序运行时生成的 MicroBridgeData 目录会原样保留 —— 用户配置不丢。
 ; 需要彻底清除时手动删除 %LOCALAPPDATA%\Programs\MicroBridge\MicroBridgeData。
-
-[Messages]
-english:FinishedHeadingLabel=Installation Complete
-english:FinishedReadyLabel=MicroBridge has been installed. Launch it from the Start menu or desktop.
-chinesesimplified:FinishedHeadingLabel=安装完成
-chinesesimplified:FinishedReadyLabel=微音桥已安装完成，可从开始菜单或桌面启动。

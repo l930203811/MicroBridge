@@ -2277,7 +2277,7 @@ private:
         menu.addItem (kPluginOffline, offline ? mb::tr ("取消离线", "Bring online")
                                               : mb::tr ("离线插件", "Take offline"), ! builtIn);
         menu.addItem (kPluginOpen, mb::tr ("打开插件界面", "Open editor window"), ! offline);
-        menu.addItem (kPluginNote, mb::tr ("添加备注", "Add note…"));
+        menu.addItem (kPluginNote, mb::tr ("重命名", "Rename"));
         // 复用通道级「快捷键与链接」弹窗：链接码是通道粒度，
         // 「效果」码控制整条插件链（内置效果 + VST3）的旁通联动。
         menu.addItem (kPluginHotkey, mb::tr ("快捷键与链接", "Hotkey & link"));
@@ -2392,10 +2392,10 @@ private:
         const auto name = bank.pluginName (index_, idx);
 
         auto* aw = new juce::AlertWindow (
-            mb::tr ("插件备注", "Plugin note"), name, juce::MessageBoxIconType::NoIcon);
+            mb::tr ("重命名插件", "Rename plugin"), name, juce::MessageBoxIconType::NoIcon);
         aw->addTextEditor ("note", bank.pluginNote (index_, idx),
-                           mb::tr ("备注（显示为「备注 (插件名)」，清空即恢复）",
-                                   "Note (shown as \"note (plugin)\"; empty = none)"));
+                           mb::tr ("新名称（显示为「名称 (插件名)」，清空即恢复原名）",
+                                   "New name (shown as \"name (plugin)\"; empty = original)"));
         aw->addButton (mb::tr ("保存", "Save"),   1);
         aw->addButton (mb::tr ("取消", "Cancel"), 0);
 
@@ -2412,7 +2412,7 @@ private:
                         {
                             bank.setPluginNote (safe->index_, idx, ed->getText());
                             safe->invalidate();
-                            safe->changed (mb::tr ("已更新插件备注", "Plugin note updated"));
+                            safe->changed (mb::tr ("已重命名插件", "Plugin renamed"));
                         }
                     }
                 }
@@ -2446,7 +2446,7 @@ private:
                 sub.addItem (kPluginItemBase + i * 8 + 2, offline ? mb::tr ("取消离线", "Bring online")
                                                                   : mb::tr ("离线插件", "Take offline"),
                             ! builtIn);
-                sub.addItem (kPluginItemBase + i * 8 + 3, mb::tr ("添加备注", "Add note…"));
+                sub.addItem (kPluginItemBase + i * 8 + 3, mb::tr ("重命名", "Rename"));
                 sub.addItem (kPluginItemBase + i * 8 + 4, mb::tr ("快捷键与链接", "Hotkey & link"));
                 sub.addItem (kPluginItemBase + i * 8 + 5, mb::tr ("查看目录", "Reveal in folder"), ! builtIn);
                 sub.addSeparator();

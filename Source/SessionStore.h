@@ -125,32 +125,38 @@ namespace mb
             root->setProperty ("fx", fx);
 
             // 每通道插件链（自带插件存 id，第三方 VST3 按名字恢复）
-            juce::Array<juce::var> plugins;
-            for (int c = 0; c < g.channelCount() && c < mb::ChannelPluginBank::kMaxChannels; ++c)
+            // 自由插件（节点视图未连接的卡片）存在停放槽，单独一份序列。
+            auto packChain = [&engine] (int ch) -> juce::Array<juce::var>
             {
                 juce::Array<juce::var> chain;
-                const int n = engine.pluginBank().pluginCount (c);
+                const int n = engine.pluginBank().pluginCount (ch);
                 for (int i = 0; i < n; ++i)
                 {
                     auto* o = new juce::DynamicObject();
-                    const int builtIn = engine.pluginBank().pluginBuiltInId (c, i);
-                    o->setProperty ("n", engine.pluginBank().pluginName (c, i));
-                    o->setProperty ("b", engine.pluginBank().pluginBypass (c, i));
+                    const int builtIn = engine.pluginBank().pluginBuiltInId (ch, i);
+                    o->setProperty ("n", engine.pluginBank().pluginName (ch, i));
+                    o->setProperty ("b", engine.pluginBank().pluginBypass (ch, i));
                     o->setProperty ("k", builtIn);
-                    o->setProperty ("o", engine.pluginBank().pluginOffline (c, i));
-                    o->setProperty ("pn", engine.pluginBank().pluginNote (c, i));
+                    o->setProperty ("o", engine.pluginBank().pluginOffline (ch, i));
+                    o->setProperty ("pn", engine.pluginBank().pluginNote (ch, i));
+                    o->setProperty ("u", engine.pluginBank().pluginUid (ch, i));
                     if (builtIn == 0)          // 第三方 VST3：连私有状态一起保存
                     {
-                        o->setProperty ("f", engine.pluginBank().pluginIdentifier (c, i));
-                        const auto state = engine.pluginBank().pluginState (c, i);
+                        o->setProperty ("f", engine.pluginBank().pluginIdentifier (ch, i));
+                        const auto state = engine.pluginBank().pluginState (ch, i);
                         if (state.getSize() > 0)
                             o->setProperty ("st", state.toBase64Encoding());
                     }
                     chain.add (juce::var (o));
                 }
-                plugins.add (chain);
-            }
+                return chain;
+            };
+            juce::Array<juce::var> plugins;
+            for (int c = 0; c < g.channelCount() && c < mb::ChannelPluginBank::kMaxChannels; ++c)
+                plugins.add (packChain (c));
             root->setProperty ("plugins", plugins);
+            root->setProperty ("freePlugins",
+                               packChain (mb::ChannelPluginBank::kFreePluginSlot));
 
             // 每通道「音频播放」播放器状态（v4）
             juce::Array<juce::var> players;
@@ -403,7 +409,81 @@ namespace mb
                 }
             }
 
-            // 插件链：自带插件按 id 恢复（fx 开关随条目），VST3 按名字匹配创建实例
+            // 插件链：自带插件按 id 恢复（fx 开关随条目），VST3 按名字匹配创建实例。
+            // ch = kFreePluginSlot 时只恢复条目，不碰 FxParams（自由插件不出声）。
+            auto restoreChain = [&engine] (int ch, const juce::var& arr)
+            {
+                auto& bank = engine.pluginBank();
+                if (! arr.isArray()) return;
+                for (const auto& pv : *arr.getArray())
+                {
+                    auto* o = pv.getDynamicObject();
+                    if (o == nullptr) continue;
+                    const auto name = o->getProperty ("n").toString();
+                    const bool bypass = static_cast<int> (o->getProperty ("b")) != 0;
+                    const int builtInId = static_cast<int> (o->getProperty ("k"));
+                    const bool offline = static_cast<int> (o->getProperty ("o")) != 0;
+                    const auto note = o->getProperty ("pn").toString();
+                    const auto uid  = o->getProperty ("u").toString();
+
+                    if (builtInId > 0)
+                    {
+                        if (ch != mb::ChannelPluginBank::kFreePluginSlot)
+                        {
+                            auto params = engine.fxParams (ch);
+                            mb::applyBuiltInToParams (params, builtInId, ! bypass);
+                            engine.setFxParams (ch, params);
+                        }
+                        bank.addBuiltIn (ch, builtInId);
+                        const int last = bank.pluginCount (ch) - 1;
+                        bank.setBypass (ch, last, bypass);
+                        bank.setPluginNote (ch, last, note);
+                        if (uid.isNotEmpty()) bank.setPluginUid (ch, last, uid);
+                        continue;
+                    }
+
+                    if (name.isEmpty()) continue;
+                    const auto b64   = o->getProperty ("st").toString();
+                    const auto ident = o->getProperty ("f").toString();
+
+                    // 离线条目：不创建实例，只占位（状态快照随 st 照常保存）
+                    if (offline)
+                    {
+                        juce::MemoryBlock st;
+                        if (b64.isNotEmpty()) st.fromBase64Encoding (b64);
+                        bank.addOfflineEntry (ch, name,
+                                              ident.isNotEmpty() ? ident : name, st);
+                        const int last = bank.pluginCount (ch) - 1;
+                        bank.setPluginNote (ch, last, note);
+                        if (uid.isNotEmpty()) bank.setPluginUid (ch, last, uid);
+                        continue;
+                    }
+
+                    auto desc = engine.pluginCatalog().findByIdentifier (ident);
+                    if (desc.name.isEmpty()) desc = engine.pluginCatalog().findByName (name);
+                    if (desc.name.isEmpty()) continue;          // 未安装：跳过
+                    const double sr = engine.sampleRate() > 8000.0
+                                    ? engine.sampleRate() : 48000.0;
+                    const int bs = engine.bufferSizeSamples() > 0
+                                 ? engine.bufferSizeSamples() : 512;
+                    juce::String err;
+                    auto inst = engine.pluginCatalog().create (desc, err, sr, bs);
+                    if (inst == nullptr) continue;
+
+                    juce::MemoryBlock state;
+                    if (b64.isNotEmpty()) state.fromBase64Encoding (b64);
+                    const auto restoredId = ident.isNotEmpty() ? ident : desc.fileOrIdentifier;
+                    if (bank.addPlugin (ch, std::move (inst), sr, bs,
+                                        state.getSize() > 0 ? &state : nullptr,
+                                        restoredId).isEmpty())
+                    {
+                        const int last = bank.pluginCount (ch) - 1;
+                        bank.setBypass (ch, last, bypass);
+                        bank.setPluginNote (ch, last, note);
+                        if (uid.isNotEmpty()) bank.setPluginUid (ch, last, uid);
+                    }
+                }
+            };
             const auto& plugArr = root->getProperty ("plugins");
             if (plugArr.isArray())
             {
@@ -411,74 +491,14 @@ namespace mb
                 for (const auto& cv : *plugArr.getArray())
                 {
                     if (c >= channels || c >= mb::ChannelPluginBank::kMaxChannels) break;
-                    if (cv.isArray())
-                    {
-                        for (const auto& pv : *cv.getArray())
-                        {
-                            auto* o = pv.getDynamicObject();
-                            if (o == nullptr) continue;
-                            const auto name = o->getProperty ("n").toString();
-                            const bool bypass = static_cast<int> (o->getProperty ("b")) != 0;
-                            const int builtInId = static_cast<int> (o->getProperty ("k"));
-                            const bool offline = static_cast<int> (o->getProperty ("o")) != 0;
-                            const auto note = o->getProperty ("pn").toString();
-                            auto& bank = engine.pluginBank();
-
-                            if (builtInId > 0)
-                            {
-                                auto params = engine.fxParams (c);
-                                mb::applyBuiltInToParams (params, builtInId, ! bypass);
-                                engine.setFxParams (c, params);
-                                bank.addBuiltIn (c, builtInId);
-                                const int last = bank.pluginCount (c) - 1;
-                                bank.setBypass (c, last, bypass);
-                                bank.setPluginNote (c, last, note);
-                                continue;
-                            }
-
-                            if (name.isEmpty()) continue;
-                            const auto b64   = o->getProperty ("st").toString();
-                            const auto ident = o->getProperty ("f").toString();
-
-                            // 离线条目：不创建实例，只占位（状态快照随 st 照常保存）
-                            if (offline)
-                            {
-                                juce::MemoryBlock st;
-                                if (b64.isNotEmpty()) st.fromBase64Encoding (b64);
-                                bank.addOfflineEntry (c, name,
-                                                      ident.isNotEmpty() ? ident : name, st);
-                                const int last = bank.pluginCount (c) - 1;
-                                bank.setPluginNote (c, last, note);
-                                continue;
-                            }
-
-                            auto desc = engine.pluginCatalog().findByIdentifier (ident);
-                            if (desc.name.isEmpty()) desc = engine.pluginCatalog().findByName (name);
-                            if (desc.name.isEmpty()) continue;          // 未安装：跳过
-                            const double sr = engine.sampleRate() > 8000.0
-                                            ? engine.sampleRate() : 48000.0;
-                            const int bs = engine.bufferSizeSamples() > 0
-                                         ? engine.bufferSizeSamples() : 512;
-                            juce::String err;
-                            auto inst = engine.pluginCatalog().create (desc, err, sr, bs);
-                            if (inst == nullptr) continue;
-
-                            juce::MemoryBlock state;
-                            if (b64.isNotEmpty()) state.fromBase64Encoding (b64);
-                            const auto restoredId = ident.isNotEmpty() ? ident : desc.fileOrIdentifier;
-                            if (bank.addPlugin (c, std::move (inst), sr, bs,
-                                                state.getSize() > 0 ? &state : nullptr,
-                                                restoredId).isEmpty())
-                            {
-                                const int last = bank.pluginCount (c) - 1;
-                                bank.setBypass (c, last, bypass);
-                                bank.setPluginNote (c, last, note);
-                            }
-                        }
-                    }
+                    restoreChain (c, cv);
                     ++c;
                 }
             }
+            // 自由插件每次载入都从存档重建（旧存档无 freePlugins → 清空）
+            engine.pluginBank().clearChannel (mb::ChannelPluginBank::kFreePluginSlot);
+            restoreChain (mb::ChannelPluginBank::kFreePluginSlot,
+                          root->getProperty ("freePlugins"));
             // 「音频播放」播放器状态恢复（v4；旧存档无此字段时保持默认）
             const auto& mpArr = root->getProperty ("players");
             if (mpArr.isArray())
