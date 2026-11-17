@@ -33,15 +33,30 @@ jobs:
           path: juce
           fetch-depth: 1
 
+      # JUCE 明确不支持 MinGW：runner 默认 shell 会选 gcc，必须加载 MSVC
+      # 环境并显式指定 cl，否则 juceaide 编译时报 "MinGW is not supported"。
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
+        shell: cmd
+        env:
+          CC: cl
+          CXX: cl
         run: >
           cmake -G Ninja -B build -S .
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_CXX_COMPILER=cl
           -DJUCE_DIR="${{ github.workspace }}/juce"
           -DMICROBRIDGE_BUILD_APP=OFF
 
       - name: Build tests
+        shell: cmd
         run: cmake --build build --config ${{ matrix.build_type }} --target RouteGraphTest ChannelRecorderTest
 
       - name: Run tests (ctest)
+        shell: cmd
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure

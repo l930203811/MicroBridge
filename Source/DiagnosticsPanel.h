@@ -16,7 +16,8 @@
 // · 引擎状态：采样率 / 缓冲 / 延迟、辅助设备数、欠载计数。
 // · 录音目录：更换目录、打开目录。
 //==============================================================================
-class DiagnosticsPanel : public juce::Component
+class DiagnosticsPanel : public juce::Component,
+                         private juce::Timer
 {
 public:
     std::function<void()> onClose;
@@ -35,46 +36,35 @@ public:
             if (onMessage) onMessage (mb::tr ("诊断报告已复制到剪贴板", "Report copied to clipboard"));
         };
 
-        addAndMakeVisible (dirBtn_);
-        dirBtn_.setButtonText (mb::tr ("更换录音目录", "Recording folder…"));
-        dirBtn_.setColour (juce::TextButton::buttonColourId, mb::ui::sectionBg);
-        dirBtn_.setColour (juce::TextButton::textColourOffId, mb::ui::text);
-        dirBtn_.onClick = [this]
+        addAndMakeVisible (resetBtn_);
+        resetBtn_.setButtonText (mb::tr ("DSP 清零", "Reset DSP"));
+        resetBtn_.setColour (juce::TextButton::buttonColourId, mb::ui::sectionBg);
+        resetBtn_.setColour (juce::TextButton::textColourOffId, mb::ui::text);
+        resetBtn_.onClick = [this]
         {
-            chooser_ = std::make_unique<juce::FileChooser> (
-                mb::tr ("选择录音目录", "Choose recording folder"), recorder_.directory());
-            chooser_->launchAsync (juce::FileBrowserComponent::openMode
-                                 | juce::FileBrowserComponent::canSelectDirectories,
-                [this] (const juce::FileChooser& fc)
-                {
-                    const auto dir = fc.getResult();
-                    if (dir.isDirectory())
-                    {
-                        recorder_.setDirectory (dir);
-                        if (onMessage)
-                            onMessage (mb::tr ("录音目录：", "Recording folder: ") + dir.getFullPathName());
-                    }
-                });
+            engine_.resetDspStats();
+            if (onMessage) onMessage (mb::tr ("DSP 耗时统计已清零", "DSP timing stats reset"));
         };
-
-        addAndMakeVisible (openBtn_);
-        openBtn_.setButtonText (mb::tr ("打开录音目录", "Open folder"));
-        openBtn_.setColour (juce::TextButton::buttonColourId, mb::ui::accent[0]);
-        openBtn_.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-        openBtn_.onClick = [this] { recorder_.directory().startAsProcess(); };
 
         addAndMakeVisible (closeBtn_);
         closeBtn_.setButtonText (mb::tr ("关闭", "Close"));
         closeBtn_.setColour (juce::TextButton::buttonColourId, mb::ui::card);
         closeBtn_.setColour (juce::TextButton::textColourOffId, mb::ui::text);
         closeBtn_.onClick = [this] { if (onClose) onClose(); };
+
+        startTimerHz (4);   // DSP 峰值/均值实时刷新（4 Hz 足够读数，开销极低）
     }
 
+    ~DiagnosticsPanel() override { stopTimer(); }
+
+private:
+    void timerCallback() override { repaint(); }
+
+public:
     void applyLanguage()
     {
         copyBtn_.setButtonText (mb::tr ("复制报告", "Copy report"));
-        dirBtn_.setButtonText  (mb::tr ("更换录音目录", "Recording folder…"));
-        openBtn_.setButtonText (mb::tr ("打开录音目录", "Open folder"));
+        resetBtn_.setButtonText(mb::tr ("DSP 清零", "Reset DSP"));
         closeBtn_.setButtonText(mb::tr ("关闭", "Close"));
         repaint();
     }
@@ -150,8 +140,26 @@ public:
                         + mb::tr ("辅助设备", "aux") + mb::S(" ") + juce::String (engine_.auxDeviceCount())
                         + mb::S("  ·  ") + mb::tr ("欠载", "underrun") + mb::S(" ")
                         + juce::String (engine_.auxUnderruns()),
+                    card.getX() + 18, card.getBottom() - 138, card.getWidth() - 36, 16,
+                    juce::Justification::centredLeft, false);
+
+        // DSP 耗时（主回调每块）：占块比用「均值」= 真实持续负载；峰值仅作尖峰参考。
+        const double blockUs = sr > 0.0 ? bs * 1.0e6 / sr : 0.0;
+        const float peakUs = engine_.dspPeakUs();
+        const float avgUs  = engine_.dspAvgUs();
+        const double ratio = blockUs > 0.0 ? static_cast<double> (avgUs) / blockUs : 0.0;
+        g.setColour (ratio >= 0.7 ? mb::ui::meterRed
+                     : ratio >= 0.4 ? mb::ui::meterYellow : mb::ui::meterGreen);
+        g.drawText (mb::tr ("DSP", "DSP") + mb::S(":  ")
+                        + mb::tr ("均值", "avg") + mb::S(" ")
+                        + juce::String (avgUs / 1000.0, 2) + mb::S(" ms  ·  ")
+                        + mb::tr ("占块", "block") + mb::S(" ")
+                        + juce::String (ratio * 100.0, 1) + mb::S(" %  ·  ")
+                        + mb::tr ("峰值", "peak") + mb::S(" ")
+                        + juce::String (peakUs / 1000.0, 2) + mb::S(" ms"),
                     card.getX() + 18, card.getBottom() - 118, card.getWidth() - 36, 16,
                     juce::Justification::centredLeft, false);
+        g.setColour (mb::ui::subText);
         g.drawText (mb::tr ("录音目录", "Recordings") + mb::S(":  ") + recorder_.directory().getFullPathName(),
                     card.getX() + 18, card.getBottom() - 98, card.getWidth() - 36, 16,
                     juce::Justification::centredLeft, false);
@@ -161,9 +169,8 @@ public:
     {
         const auto card = cardBounds().toNearestInt();
         const int btnY = card.getBottom() - 44;
-        copyBtn_.setBounds (card.getX() + 16,  btnY, 92, 28);
-        dirBtn_.setBounds  (card.getX() + 116, btnY, 120, 28);
-        openBtn_.setBounds (card.getX() + 244, btnY, 110, 28);
+        copyBtn_.setBounds  (card.getX() + 16,  btnY, 96, 28);
+        resetBtn_.setBounds (card.getX() + 120, btnY, 96, 28);
         closeBtn_.setBounds (card.getRight() - 108, btnY, 92, 28);
     }
 
@@ -200,6 +207,19 @@ private:
                    + juce::String (engine_.auxDeviceCount())
                    + mb::S(" / ") + mb::tr ("欠载", "underruns") + mb::S(": ")
                    + juce::String (engine_.auxUnderruns()));
+        {
+            const double blockUs = sr > 0.0 ? bs * 1.0e6 / sr : 0.0;
+            const float peakUs = engine_.dspPeakUs();
+            const float avgUs  = engine_.dspAvgUs();
+            const double ratio = blockUs > 0.0 ? static_cast<double> (avgUs) / blockUs : 0.0;
+            lines.add (mb::tr ("DSP 耗时", "DSP load") + mb::S(": ")
+                       + mb::tr ("均值", "avg") + mb::S(" ")
+                       + juce::String (avgUs / 1000.0, 3) + mb::S(" ms  (")
+                       + juce::String (ratio * 100.0, 1) + mb::S(" % ")
+                       + mb::tr ("占块", "of block") + mb::S(") / ")
+                       + mb::tr ("峰值", "peak") + mb::S(" ")
+                       + juce::String (peakUs / 1000.0, 3) + mb::S(" ms"));
+        }
         lines.add (juce::String());
 
         const auto& devs = engine_.catalog().devices();
@@ -217,8 +237,7 @@ private:
     mb::AudioEngine& engine_;
     mb::ChannelRecorder& recorder_;
 
-    juce::TextButton copyBtn_, dirBtn_, openBtn_, closeBtn_;
-    std::unique_ptr<juce::FileChooser> chooser_;
+    juce::TextButton copyBtn_, resetBtn_, closeBtn_;
 
     JUCE_DECLARE_NON_COPYABLE (DiagnosticsPanel)
 };

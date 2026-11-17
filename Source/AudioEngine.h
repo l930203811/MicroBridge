@@ -879,6 +879,19 @@ namespace mb
             return total;
         }
 
+        /** 主回调每块 DSP 耗时（微秒）：峰值（自上次清零）+ 指数滑动均值。
+            低缓冲压测核心指标——耗时逼近块时长即会 underrun。
+            64 f @48k = 1333 µs、128 f = 2667 µs。音频线程单写、UI 定时只读。 */
+        float dspPeakUs() const noexcept { return dspPeakUs_.load (std::memory_order_relaxed); }
+        float dspAvgUs()  const noexcept { return dspAvgUs_.load  (std::memory_order_relaxed); }
+        void resetDspStats() noexcept
+        {
+            dspPeakUs_.store (0.0f, std::memory_order_relaxed);
+            dspAvgUs_.store  (0.0f, std::memory_order_relaxed);
+            dspWarmup_.store (64, std::memory_order_relaxed);
+            dspWindowBlocks_.store (0, std::memory_order_relaxed);
+        }
+
         /** 每通道输出峰值（推子后，relaxed 原子），UI 定时读取。
             已乘通道推子增益；静音/独奏剔除/喇叭关闭的通道恒为 0。 */
         float channelPeak (int ch) const noexcept
@@ -977,6 +990,10 @@ namespace mb
             const auto plan = graph_.plan();
             const auto routing = routing_.load (std::memory_order_acquire);
             if (plan == nullptr || routing == nullptr) return;
+
+            // DSP 耗时计时起点（QPC 高精度）。每块两次时钟读取约几十 ns，
+            // 相对最小块 64 f @48k = 1333 µs 可忽略。
+            const auto dspT0 = juce::Time::getHighResolutionTicks();
 
             // 宿主播放头：每个音频块推进一次，插件在 processBlock 里通过
             // getPlayHead()->getPosition() 读到连续递增的时间轴与 isPlaying=true。
@@ -1205,6 +1222,43 @@ namespace mb
             }
             if (sumMode) recorder_.pushSum (recMix_[0].data(), recMix_[1].data(), n);
             inputPeak_.store (peak, std::memory_order_relaxed);
+
+            // DSP 耗时统计（µs）：QPC 差值 → 微秒。峰值 CAS 取 max，
+            // 均值 EMA(α=1/64) 平滑块间抖动；纯原子、零锁、零分配。
+            const auto dspDt = juce::Time::getHighResolutionTicks() - dspT0;
+            const float dspUs = static_cast<float> (
+                static_cast<double> (dspDt) * 1.0e6
+                / static_cast<double> (juce::Time::getHighResolutionTicksPerSecond()));
+            {
+                const float avg = dspAvgUs_.load (std::memory_order_relaxed);
+                dspAvgUs_.store (avg <= 0.0f ? dspUs : avg + (dspUs - avg) * (1.0f / 64.0f),
+                                 std::memory_order_relaxed);
+
+                // 启动预热：前 64 块只更新均值，不计峰值（初始化/首次分配的尖峰不代表稳态）。
+                int warm = dspWarmup_.load (std::memory_order_relaxed);
+                if (warm > 0)
+                {
+                    dspWarmup_.store (warm - 1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    // 峰值滑动窗口：每 4096 块（@48k/256f ≈ 21.8 s）重置一次，
+                    // 避免一次偶发尖峰永久卡在显示值里。
+                    int win = dspWindowBlocks_.load (std::memory_order_relaxed) + 1;
+                    if (win >= 4096)
+                    {
+                        dspWindowBlocks_.store (0, std::memory_order_relaxed);
+                        dspPeakUs_.store (dspUs, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        dspWindowBlocks_.store (win, std::memory_order_relaxed);
+                        float pk = dspPeakUs_.load (std::memory_order_relaxed);
+                        while (dspUs > pk && ! dspPeakUs_.compare_exchange_weak
+                                   (pk, dspUs, std::memory_order_relaxed)) {}
+                    }
+                }
+            }
         }
 
         void audioDeviceAboutToStart (juce::AudioIODevice*) override
@@ -1458,6 +1512,12 @@ namespace mb
         mutable std::array<std::atomic<float>, kMaxChannels> peaksR_;    // 推子后 R
         mutable std::array<std::atomic<float>, kMaxPorts> portPeaks_;
         std::atomic<float> inputPeak_ { 0.0f };
+
+        // 主回调 DSP 耗时统计（µs）：音频线程单写，UI 只读。
+        // 峰值用 CAS 取 max + 滑动窗口自动重置；均值 EMA（α=1/64）。
+        // 启动前 64 块跳过峰值（设备初始化尖峰不代表稳态负载）。
+        std::atomic<float> dspPeakUs_ { 0.0f }, dspAvgUs_ { 0.0f };
+        std::atomic<int> dspWarmup_ { 64 }, dspWindowBlocks_ { 0 };
 
         // 通道效果链 / 录音 / VST3 插件
         mb::ChannelFxBank fxBank_;
