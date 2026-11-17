@@ -124,6 +124,32 @@ thread never reads the mutable device catalogue. See [docs/ARCHITECTURE.md](docs
 6. Pushing audio into OBS still relies on an external virtual cable (VB-CABLE /
    Voicemeeter). Bundling a driver is deliberately deferred.
 
+## Installation (Windows x64)
+
+**Portable by design**: all settings, sessions, presets and device choices live in a
+`MicroBridgeData` folder **next to the exe** — nothing is written to the registry.
+Install it somewhere the user can write to.
+
+**Option A — Installer (recommended)**
+1. Download `MicroBridgeSetup-0.1.0.exe` from Releases and run it.
+2. It installs to `%LOCALAPPDATA%\Programs\MicroBridge` by default (no admin rights
+   required) and creates Start-menu and desktop shortcuts.
+3. Uninstall removes only the program; `MicroBridgeData` is kept. Delete that folder
+   manually for a complete removal.
+
+**Option B — Dependency-free script** (if Inno Setup is unavailable): build the Release
+exe below, then
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\Install.ps1             # install
+powershell -ExecutionPolicy Bypass -File installer\Install.ps1 -Uninstall  # uninstall
+```
+
+**Option C — Portable**: just copy `MicroBridge.exe` alone into any writable folder.
+`MicroBridgeData` is created automatically on first launch.
+
+> Maintainers can rebuild the installer with Inno Setup 6:
+> `ISCC.exe installer\MicroBridge.iss`; output goes to `installer\Output\`.
+
 ## Build (Windows x64)
 
 Requires MSVC 14.5x, Windows SDK 10.0.26100.0, CMake ≥ 3.22, Ninja, and a **JUCE 8.x**

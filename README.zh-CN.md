@@ -99,6 +99,29 @@
 5. 辅助设备额外引入约 `max(1024, 4 × 缓冲)` 帧延迟（48 kHz 下约 21 ms）；主设备路径无额外缓冲。
 6. 推送到 OBS 仍依赖外部虚拟声卡（VB-CABLE / Voicemeeter）；随包安装驱动涉及签名与权限，暂缓。
 
+## 安装（Windows x64）
+
+**便携化设计**：所有设置、会话、预设、设备选择都存放在 **exe 同级的 `MicroBridgeData` 文件夹**，
+随程序走、不写注册表。因此程序必须安装在**用户可写**的位置。
+
+**方式 A — 安装包（推荐）**
+1. 从 Releases 下载 `MicroBridgeSetup-0.1.0.exe`，双击安装。
+2. 默认装到 `%LOCALAPPDATA%\Programs\MicroBridge`（无需管理员权限），
+   自动创建开始菜单与桌面快捷方式。
+3. 卸载只删程序本体，`MicroBridgeData` 用户数据保留；要彻底清除需手动删除该文件夹。
+
+**方式 B — 免依赖脚本**（没装 Inno Setup 时）：先按下方构建出 Release exe，然后
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\Install.ps1        # 安装
+powershell -ExecutionPolicy Bypass -File installer\Install.ps1 -Uninstall   # 卸载
+```
+
+**方式 C — 绿色版**：直接把 `MicroBridge.exe` 单独复制到任意可写文件夹即可运行，
+首次启动会自动创建 `MicroBridgeData`。
+
+> 维护者可用 `installer/MicroBridge.iss` 通过 Inno Setup 6 重新编译安装包：
+> `ISCC.exe installer\MicroBridge.iss`，产物在 `installer\Output\`。
+
 ## 构建（Windows x64）
 
 依赖：MSVC 14.5x、Windows SDK 10.0.26100.0、CMake ≥ 3.22、Ninja，以及一份 **JUCE 8.x** 源码树。
