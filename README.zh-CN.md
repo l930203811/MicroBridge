@@ -2,7 +2,13 @@
 
 **简体中文** · **[English](README.md)**
 
-![微音桥界面](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot-cn1.png" width="49%" alt="微音桥 中文界面（浅色）">
+  <img src="docs/screenshot-cn2.png" width="49%" alt="微音桥 中文界面（深色）">
+  <br>
+  <img src="docs/screenshot-en1.png" width="49%" alt="MicroBridge English UI (light)">
+  <img src="docs/screenshot-en2.png" width="49%" alt="MicroBridge English UI (dark)">
+</p>
 
 > Windows 上的轻量**软件配线架**。没有固定总线：每条通道自己指定输入源与输出目标，
 > 输出目标包含本机所有声卡驱动，也可以送进其他通道作为输入源。同时内置媒体播放器、

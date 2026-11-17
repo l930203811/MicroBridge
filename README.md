@@ -2,7 +2,13 @@
 
 **[简体中文](README.zh-CN.md)** · English
 
-![MicroBridge UI](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot-en1.png" width="49%" alt="MicroBridge English UI (light)">
+  <img src="docs/screenshot-en2.png" width="49%" alt="MicroBridge English UI (dark)">
+  <br>
+  <img src="docs/screenshot-cn1.png" width="49%" alt="微音桥 中文界面（浅色）">
+  <img src="docs/screenshot-cn2.png" width="49%" alt="微音桥 中文界面（深色）">
+</p>
 
 > A lightweight **audio patchbay** for Windows. No fixed buses: every channel picks its own
 > input sources and output targets, including every sound-card driver on the machine and
