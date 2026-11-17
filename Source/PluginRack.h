@@ -361,11 +361,12 @@ namespace mb
 
         ChannelPluginBank()
         {
-            for (auto& b : scratch_)
-            {
-                b[0].assign (8192, 0.0f);
-                b[1].assign (8192, 0.0f);
-            }
+            // 插件处理缓冲必须容纳插件的全部输出总线：Remix 等音源分离类插件
+            // 有 6 条输出总线（12 通道）。若只给 2 通道，JUCE VST3 包装器在
+            // HostBufferMapper 里对 getWritePointer(2..11) 取到越界野指针，
+            // 插件往野指针写 stem 数据 → 主输出静音 + 堆损坏（界面偶发打不开）。
+            // 这里先按立体声预分配，添加插件时按实际总线数扩容。
+            ensureProcChannels (2);
         }
 
         ~ChannelPluginBank() = default;
@@ -542,6 +543,8 @@ namespace mb
             }
             p->prepareToPlay (sampleRate > 8000.0 ? sampleRate : 48000.0,
                               juce::jlimit (32, 8192, blockSize > 0 ? blockSize : 512));
+            ensureProcChannels (juce::jmax (p->getTotalNumInputChannels(),
+                                            p->getTotalNumOutputChannels()));
 
             e.instance = std::move (p);
             e.offline = false;
@@ -664,6 +667,11 @@ namespace mb
             juce::String err;
             p->prepareToPlay (sampleRate > 8000.0 ? sampleRate : 48000.0,
                               juce::jlimit (32, 8192, blockSize > 0 ? blockSize : 512));
+
+            // 处理缓冲按插件实际总线数扩容（消息线程，音频槽快照尚未发布）。
+            // 必须在 publishLocked 之前，保证音频线程拿到新链时缓冲已够大。
+            ensureProcChannels (juce::jmax (p->getTotalNumInputChannels(),
+                                            p->getTotalNumOutputChannels()));
 
             PluginEntry e;
             e.name = p->getName();
@@ -815,7 +823,12 @@ namespace mb
             for (auto& v : slots_)
                 for (auto& e : v)
                     if (e.instance != nullptr)
+                    {
+                        // 会话恢复 / 采样率变化后同样要扩容（ensure 无锁，调用处已持锁）
+                        ensureProcChannels (juce::jmax (e.instance->getTotalNumInputChannels(),
+                                                        e.instance->getTotalNumOutputChannels()));
                         e.instance->prepareToPlay (sampleRate, bs);
+                    }
         }
 
         /** 音频线程：每个处理块推进一次宿主时间轴（全部插件共用）。 */
@@ -839,13 +852,22 @@ namespace mb
             const auto chain = chains_[static_cast<size_t> (ch)].load (std::memory_order_acquire);
             if (chain == nullptr || chain->empty()) return;
 
-            auto& l = scratch_[static_cast<size_t> (ch)][0];
-            auto& r = scratch_[static_cast<size_t> (ch)][1];
-            juce::FloatVectorOperations::copy (l.data(), L, n);
-            juce::FloatVectorOperations::copy (r.data(), R, n);
+            // 处理缓冲按插件实际总线数扩容（见 ensureProcChannels）。VST3 包装器
+            // 会把多总线插件的每条输出总线映射到 buffer.getWritePointer(k)，
+            // 通道不足就是越界野指针 —— 必须让缓冲覆盖插件全部输出通道。
+            const auto pb = procBuf_.load (std::memory_order_acquire);
+            if (pb == nullptr || n > pb->owned.getNumSamples()) return;
 
-            float* ptrs[2] = { l.data(), r.data() };
-            processBuf_.setDataToReferTo (ptrs, 2, n);
+            // 通道 L/R 写进总线 0；其余总线清零（部分插件读它们做侧链/stem）。
+            auto* const d0 = pb->ptrs[(size_t) 0];
+            auto* const d1 = pb->ptrs[(size_t) 1];
+            juce::FloatVectorOperations::copy (d0, L, n);
+            juce::FloatVectorOperations::copy (d1, R, n);
+            for (int c = 2; c < pb->numChannels; ++c)
+                juce::FloatVectorOperations::clear (pb->ptrs[(size_t) c], n);
+
+            // 每块用当前块长建立视图（零分配）；视图引用 pb 拥有的稳定内存。
+            processBuf_.setDataToReferTo (pb->ptrs.data(), pb->numChannels, n);
             midi_.clear();
 
             for (const auto& s : *chain)
@@ -854,9 +876,9 @@ namespace mb
                 s.plugin->processBlock (processBuf_, midi_);
             }
 
-            // 立体声：L/R 各自直写回通道缓冲（不再混回单声道）
-            juce::FloatVectorOperations::copy (L, l.data(), n);
-            juce::FloatVectorOperations::copy (R, r.data(), n);
+            // 主输出（总线 0 的 L/R）写回通道；stem 总线不走通道，避免混叠。
+            juce::FloatVectorOperations::copy (L, d0, n);
+            juce::FloatVectorOperations::copy (R, d1, n);
         }
 
     private:
@@ -864,6 +886,31 @@ namespace mb
         using Chain = std::vector<SlotSnap>;
 
         static bool valid (int ch) noexcept { return ch >= 0 && ch < kMaxChannels; }
+
+        /** 插件处理缓冲：owned 拥有稳定内存，ptrs 指向各通道，音频线程只读快照。 */
+        struct ProcBuffer
+        {
+            explicit ProcBuffer (int nc) : numChannels (juce::jmax (2, nc))
+            {
+                owned.setSize (numChannels, 8192);
+                ptrs.resize (static_cast<size_t> (numChannels));
+                for (int c = 0; c < numChannels; ++c)
+                    ptrs[(size_t) c] = owned.getWritePointer (c);
+            }
+            juce::AudioBuffer<float> owned;
+            std::vector<float*> ptrs;
+            int numChannels = 2;
+        };
+
+        /** 消息线程调用（addPlugin / prepare 已持锁）：按插件总线数扩容处理缓冲。
+         *  只增不减，避免音频线程正引用的快照内存被释放；旧快照靠 shared_ptr 引用计数
+         *  在音频线程远离后自然析构。 */
+        void ensureProcChannels (int need)
+        {
+            auto cur = procBuf_.load (std::memory_order_acquire);
+            if (cur != nullptr && need <= cur->numChannels) return;
+            procBuf_.store (std::make_shared<ProcBuffer> (need), std::memory_order_release);
+        }
 
         void publishLocked (int ch)
         {
@@ -896,8 +943,8 @@ namespace mb
         std::array<std::atomic<std::shared_ptr<const Chain>>, kMaxChannels> chains_; // 音频侧
         std::vector<std::pair<std::uint32_t, std::unique_ptr<juce::AudioPluginInstance>>> retired_;
 
-        std::array<std::array<std::vector<float>, 2>, kMaxChannels> scratch_;
-        juce::AudioBuffer<float> processBuf_;
+        std::atomic<std::shared_ptr<const ProcBuffer>> procBuf_;  // 处理缓冲快照（音频线程 acquire 读）
+        juce::AudioBuffer<float> processBuf_;   // 每块 setDataToReferTo 引用 procBuf_ 的 owned
         juce::MidiBuffer midi_;
 
         JUCE_DECLARE_NON_COPYABLE (ChannelPluginBank)
