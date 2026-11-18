@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-project(MicroBridge VERSION 0.1.0 LANGUAGES C CXX)
+project(MicroBridge VERSION 0.1.1 LANGUAGES C CXX)
 
 # 轻量化约束：不复制 JUCE 源码树，直接复用本机已有的 JUCE 8.0.15。
 # 换机器时用 -DJUCE_DIR=<juce-8.x 根目录> 覆盖。
