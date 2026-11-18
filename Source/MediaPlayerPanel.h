@@ -727,7 +727,9 @@ public:
         }
 
         // ---- 左栏：顶部 添加音频 + 旁通，播放列表撑满其余高度 ---------------
-        const int sx = card.getX() + 14, sw = 232;
+        // 列表过宽：232 → 174（-1/4）。同时把省下的 58px 从浮层窗口宽度里
+        // 一并扣掉（normalSize / minCardSize 同步减），右侧频谱/走带区宽度不变。
+        const int sx = card.getX() + 14, sw = 174;
         addBtn_.setBounds   (sx, card.getY() + 44, sw - 56, 26);
         bypassBtn_.setBounds (sx + sw - 52, card.getY() + 44, 52, 26);
         playlist_.setBounds (sx, card.getY() + 78, sw, juce::jmax (40, H - 78 - 44));
@@ -800,14 +802,16 @@ private:
     {
         const float W = (float) getWidth(), H = (float) getHeight();
         constexpr float margin = 22.0f;
-        const float w = juce::jmin (900.0f, juce::jmax (320.0f, W - margin * 2.0f));
+        // 左栏由 232 收窄到 174，窗口默认宽度同步减 58（900 → 842）：
+        // 裁剪掉的部分同步从插件窗口宽度里扣除，右侧频谱/走带区保持原宽度。
+        const float w = juce::jmin (842.0f, juce::jmax (320.0f, W - margin * 2.0f));
         const float h = juce::jmax (300.0f, H - margin * 2.0f);
         return { w, h };
     }
 
-    /** 缩放下限：左栏 232 + 走带按钮组约 450 + 边距；
+    /** 缩放下限：左栏 174 + 走带按钮组约 450 + 边距（较原来各减 58）；
         频谱 / 进度 / 走带 / 路径四层至少 320 高。小窗口由基类钳到窗口内。 */
-    juce::Point<float> minCardSize() const override { return { 760.0f, 320.0f }; }
+    juce::Point<float> minCardSize() const override { return { 702.0f, 320.0f }; }
 
     /** 折叠态 = 紧凑控制条：只装 播放三键（左）+ 还原键（右），无最大化/关闭。
         宽度 = 6 + 28+4+32+4+28（三键）+ 12 + 34（还原键）+ 6 ≈ 154，取 160 留余量。

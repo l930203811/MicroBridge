@@ -92,8 +92,8 @@ public:
         styleButton (hotkeyBtn_);
         styleButton (unlockHotkeyBtn_);
         styleButton (lightTheme_);          // 深浅模式：切换按钮（与抽屉入口同步）
-        styleButton (repoBtn_);             // 关于：打开仓库主页
-        styleButton (copyRepoBtn_);         // 关于：复制仓库链接
+        addAndMakeVisible (repoBtn_);       // 关于：仓库 URL 透明点击热区（文字由 paint 绘制）
+        styleButton (copyRepoBtn_);         // 关于：链接右侧图标复制按钮（无标题）
         for (int i = 0; i < kTabCount; ++i)  // 分类 Tab：常规 / 界面 / 录音 / 设备设置 / 插件库 / 其他 / 快捷键 / 关于
         {
             styleButton (tabBtns_[i]);
@@ -220,6 +220,13 @@ public:
         };
         newInstanceBtn_.onClick = [this] { if (onLaunchNewInstance) onLaunchNewInstance(); };
         restartBtn_.onClick     = [this] { if (onRestartApp) onRestartApp(); };
+        // 仓库地址做成可点击链接：透明按钮覆盖在 paint 绘制的 URL 文字上
+        repoBtn_.setButtonText ({});
+        repoBtn_.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        repoBtn_.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
+        repoBtn_.setColour (juce::TextButton::buttonOnColourId, juce::Colours::transparentBlack);
+        repoBtn_.setColour (juce::TextButton::textColourOffId, juce::Colours::transparentBlack);
+        repoBtn_.setColour (juce::TextButton::textColourOnId, juce::Colours::transparentBlack);
         repoBtn_.onClick = []
         {
             juce::URL (mb::kRepoUrl).launchInDefaultBrowser();
@@ -290,8 +297,9 @@ public:
         openDirBtn_.setButtonText (mb::tr ("打开目录", "Open folder"));
         newInstanceBtn_.setButtonText (mb::tr ("启动新实例", "New instance"));
         restartBtn_.setButtonText     (mb::tr ("重启应用", "Restart app"));
-        repoBtn_.setButtonText      (mb::tr ("打开仓库主页", "Open repository"));
-        copyRepoBtn_.setButtonText  (mb::tr ("复制链接", "Copy link"));
+        // repoBtn_ 为透明链接热区，文字由 paint 画成带下划线的 URL；不设按钮文字
+        copyRepoBtn_.setButtonText  (mb::S ("\xe2\xa7\x89"));   // ⧉ 复制图标，无标题
+        copyRepoBtn_.setTooltip (mb::tr ("复制仓库地址", "Copy repository URL"));
         restartBtn_.setTooltip (mb::tr ("保存会话后关闭当前实例并重新打开",
                                         "Save session, quit and relaunch"));
         newInstanceBtn_.setTooltip (mb::tr ("以新进程再启动一份应用（互斥保护不受影响）",
@@ -600,13 +608,22 @@ public:
                                 "Lightweight audio routing rack for Windows — a software patch bay"),
                         cx, py + 74, cw, 16, juce::Justification::centredLeft, false);
 
-            // 仓库地址
+            // 仓库地址：强调色 + 下划线，外观即"可点击链接"（上方 repoBtn_ 透明热区负责跳转）
             g.setFont (mb::ui::font (9.0f, true));
+            g.setColour (mb::ui::subText);
             g.drawText (mb::tr ("项目仓库", "Repository"),
                         cx, py + 118, cw, 16, juce::Justification::centredLeft, false);
-            g.setFont (mb::ui::font (9.5f));
-            g.drawText (mb::S (mb::kRepoUrl),
-                        cx, py + 138, cw, 16, juce::Justification::centredLeft, false);
+            {
+                const auto urlText = mb::S (mb::kRepoUrl);
+                const auto urlFont = mb::ui::font (9.5f);
+                const int  urlW    = juce::roundToInt (juce::GlyphArrangement::getStringWidth (urlFont, urlText));
+                g.setFont (urlFont);
+                g.setColour (mb::ui::accent[0]);
+                g.drawText (urlText, cx, py + 138, urlW + 4, 16,
+                            juce::Justification::centredLeft, false);
+                g.drawLine (juce::Line<float> ((float) cx, py + 153.0f,
+                                               (float) (cx + urlW), py + 153.0f), 1.0f);
+            }
 
             // 说明（自动换行，不越出面板边框）
             juce::AttributedString note (mb::tr (
@@ -682,9 +699,14 @@ public:
         newInstanceBtn_.setBounds (x + colW3 + 24,      py + 42, colW3, 30);
         restartBtn_.setBounds     (x + 2 * (colW3 + 24),py + 42, colW3, 30);
 
-        // 关于 Tab：仓库主页 + 复制链接 两列一行（与 paint 的 URL 行对齐）
-        repoBtn_.setBounds     (x,               py + 214, colW3,     30);
-        copyRepoBtn_.setBounds (x + colW3 + 24,  py + 214, colW3,     30);
+        // 关于 Tab：URL 透明热区精确覆盖链接文字；复制图标按钮紧贴链接右侧
+        {
+            const auto urlText = mb::S (mb::kRepoUrl);
+            const int  urlW    = juce::roundToInt (juce::GlyphArrangement::getStringWidth (
+                                     mb::ui::font (9.5f), urlText));
+            repoBtn_.setBounds     (x, py + 136, urlW + 6, 20);          // 覆盖 URL 行
+            copyRepoBtn_.setBounds (x + urlW + 12, py + 137, 26, 18);    // 链接右侧图标按钮
+        }
 
         // 快捷键 Tab：左列上下两条录入按钮，右列两个隐藏方式单选
         hotkeyBtn_.setBounds       (x,   py + 44,  colW2, 30);
@@ -728,7 +750,7 @@ public:
         unlockHotkeyBtn_.setVisible (t5);
         hideTrayMode_.setVisible (t5);
         hideFullMode_.setVisible (t5);
-        repoBtn_.setVisible (t7);               // 关于：仓库主页 / 复制链接
+        repoBtn_.setVisible (t7);               // 关于：URL 链接热区 / 右侧复制图标
         copyRepoBtn_.setVisible (t7);
     }
 
@@ -791,7 +813,7 @@ public:
             styleToggleColour (*b);
         for (auto* b : { &langBtn_, &diagBtn_, &dirBtn_,
                          &openDirBtn_, &closeBtn_, &applyDeviceBtn_, &newInstanceBtn_, &restartBtn_,
-                         &repoBtn_, &copyRepoBtn_,
+                         &copyRepoBtn_,  // repoBtn_ 是透明链接热区，不套按钮底色
                          &hotkeyBtn_, &unlockHotkeyBtn_, &lightTheme_ })
             styleButtonColour (*b);
         refreshTabStyles();
@@ -869,7 +891,7 @@ private:
     juce::TextButton langBtn_, diagBtn_, dirBtn_, openDirBtn_, closeBtn_;
     juce::TextButton applyDeviceBtn_;                 // 设备设置 Tab 的页脚「应用」
     juce::TextButton newInstanceBtn_, restartBtn_;   // 「其他」区按钮行
-    juce::TextButton repoBtn_, copyRepoBtn_;         // 「关于」区按钮行（打开仓库 / 复制链接）
+    juce::TextButton repoBtn_, copyRepoBtn_;         // 「关于」区：URL 透明链接热区 + 右侧复制图标
     juce::ComboBox fmtCombo_, bitsCombo_, srCombo_, modeCombo_, scaleCombo_;
     juce::TextButton hotkeyBtn_;                      // 全局隐藏/恢复快捷键录入按钮
     juce::TextButton unlockHotkeyBtn_;                // 锁定/解锁桌面歌词切换快捷键录入按钮
