@@ -195,7 +195,9 @@ docs/ARCHITECTURE.md       模块设计与实时约束
 
 Copyright (C) 2026 SKCore。
 
-本项目采用 **GNU 通用公共许可证 v3.0（GPL v3）**，完整条款见 [`LICENSE`](LICENSE) 文件。
+本项目采用 **GNU Affero 通用公共许可证 v3.0（AGPLv3）**，完整条款见 [`LICENSE`](LICENSE) 文件。
+之所以选 AGPLv3，是因为项目基于 JUCE 8 构建，而 JUCE 8 的开源许可正是 AGPLv3。
 
-你可以依据 GPL v3 自由使用、修改与再分发。请注意本项目捆绑或引用的第三方组件
-（如 Steinberg ASIO SDK、JUCE 及模型权重）各有独立许可，分发二进制前请自行核对。
+你可以依据 AGPLv3 自由使用、修改与再分发。第三方组件（JUCE、Steinberg VST3/ASIO SDK、
+Windows Media Foundation、被托管的插件）各有独立许可，分发二进制前请见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。闭源分发须另购 JUCE 商业许可。

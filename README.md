@@ -221,10 +221,12 @@ class 9 / 42 similarity search before registering. Public web search only, not l
 
 Copyright (C) 2026 SKCore.
 
-This project is licensed under the **GNU General Public License v3.0** — see the
-[`LICENSE`](LICENSE) file for the full text.
+This project is licensed under the **GNU Affero General Public License v3.0
+(AGPLv3)** — see the [`LICENSE`](LICENSE) file for the full text. AGPLv3 is used
+because the project is built on JUCE 8, whose open-source licence is AGPLv3.
 
-You may redistribute and modify it under the terms of the GPL v3. Note that
-third-party components bundled or referenced by this project (e.g. the Steinberg
-ASIO SDK, JUCE, and model weights) carry their own licences; review those terms
-before redistributing binaries.
+You may redistribute and modify it under the terms of the AGPLv3. Third-party
+components (JUCE, Steinberg VST3/ASIO SDKs, Windows Media Foundation, hosted
+plugins) carry their own licences — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
+before redistributing binaries. Closed-source distribution requires a commercial
+JUCE licence.
