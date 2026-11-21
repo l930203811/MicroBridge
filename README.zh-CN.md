@@ -190,3 +190,12 @@ docs/ARCHITECTURE.md       模块设计与实时约束
 `MicroBridge` 在 GitHub 上有若干无关的 Arduino 时代同名项目，国内也有公司字号含「音桥」。
 作为开源产品名可用；若要注册商标，请先在中国商标网做第 9 / 42 类近似查询。
 以上为公开网络检索，不构成法律意见。
+
+## 许可
+
+Copyright (C) 2026 SKCore。
+
+本项目采用 **GNU 通用公共许可证 v3.0（GPL v3）**，完整条款见 [`LICENSE`](LICENSE) 文件。
+
+你可以依据 GPL v3 自由使用、修改与再分发。请注意本项目捆绑或引用的第三方组件
+（如 Steinberg ASIO SDK、JUCE 及模型权重）各有独立许可，分发二进制前请自行核对。

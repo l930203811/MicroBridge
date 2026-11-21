@@ -216,3 +216,15 @@ docs/ARCHITECTURE.md       module design and realtime constraints
 `MicroBridge` has unrelated Arduino-era repositories on GitHub, and some Chinese company
 names contain 「音桥」. Fine as an open-source project name; run a China Trademark Office
 class 9 / 42 similarity search before registering. Public web search only, not legal advice.
+
+## License
+
+Copyright (C) 2026 SKCore.
+
+This project is licensed under the **GNU General Public License v3.0** — see the
+[`LICENSE`](LICENSE) file for the full text.
+
+You may redistribute and modify it under the terms of the GPL v3. Note that
+third-party components bundled or referenced by this project (e.g. the Steinberg
+ASIO SDK, JUCE, and model weights) carry their own licences; review those terms
+before redistributing binaries.
