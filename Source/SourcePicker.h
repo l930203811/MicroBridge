@@ -314,6 +314,7 @@ private:
                                    [&] (int c) { return input_ ? hasCCEdge (c, ch_)
                                                                : hasCCEdge (ch_, c); });
 
+        const int chanW = chanList_.getWidth();       // 右栏实际宽度（卡片加宽后随之变化）
         int prevChan = -1;
         for (int c : chans)
         {
@@ -326,6 +327,9 @@ private:
             for (int s = 0; s < 2; ++s)
             {
                 Row r; r.kind = Row::Chan; r.a = c; r.side = s;
+                // 行宽必须跟随右栏实际宽度；否则沿用 Row 默认 w=100，
+                // 「CHn + 通道备注 + ·L/R」会被省略号截断（与卡片宽度无关）。
+                r.x = 12; r.w = juce::jmax (120, chanW - 24);
                 r.dim = st == -1 || st == s;
                 r.text = mb::S("CH") + juce::String (c + 1) + mb::S("    ")
                        + mb::channelDisplayName (c)
@@ -409,8 +413,10 @@ private:
                     }
                     g.setFont (mb::ui::font (11.5f, r.stereo || r.dim));
                     g.setColour (r.dim ? mb::ui::accent[0] : mb::ui::text);
-                    g.drawText (r.text, b.reduced (14.0f, 0.0f).toNearestInt(),
-                                juce::Justification::centredLeft, true);
+                    // 用缩放而非省略号：极长通道备注名仍完整可读（含末尾 ·L/R），
+                    // 不会被 drawText 的 useEllipses 截成「直播输...」。
+                    g.drawFittedText (r.text, b.reduced (14.0f, 0.0f).toNearestInt(),
+                                      juce::Justification::centredLeft, 1, 0.55f);
                     break;
                 }
             }
@@ -525,10 +531,12 @@ private:
     void layoutCard()
     {
         const int pw = getWidth(), ph = getHeight();
-        const int w = juce::jlimit (480, 640, juce::jmin (600, pw - 60));
+        // 右栏通道名（CHn + 备注 + ·L/R）较长，分界左移 + 卡片略加宽，把增量主要给右栏，
+        // 避免通道名被省略号截断；左栏设备名用 drawFittedText 缩放，宽度略减不影响可读性。
+        const int w = juce::jlimit (480, 680, juce::jmin (660, pw - 60));
         const int h = juce::jlimit (300, 560, juce::jmin (540, ph - 80));
         card_.setBounds ((pw - w) / 2, (ph - h) / 2, w, h);
-        card_.devSplit = juce::jmax (260, static_cast<int> (w * 0.62f));
+        card_.devSplit = juce::jmax (260, static_cast<int> (w * 0.55f));
 
         card_.title = input_ ? mb::tr ("输入源", "Input Source")
                              : mb::tr ("输出目标", "Output Destination");
@@ -711,7 +719,8 @@ private:
     }
 
     //==========================================================================
-    // 右栏：第三方 VST3 按厂商分组，组内自适应流式平铺（常规四列，长名加宽）
+    // 右栏：第三方 VST3 按厂商分组，组内自适应流式平铺（常规两列，长名加宽）
+    // 每格约 (avail-6)/2 ≈ 180px，避免 VST3 长名在窄格里被省略号截断。
     //==========================================================================
     void buildRight()
     {
@@ -744,7 +753,7 @@ private:
             per[static_cast<size_t> (vi)].push_back (i);
         }
         const int avail = juce::jmax (80, colW) - 24;
-        const int minCell = juce::jmax (90, (avail - 18) / 4); // 常规四列（扣除列间距）
+        const int minCell = juce::jmax (140, (avail - 6) / 2); // 常规两列（扣除列间距）
         for (int v = 0; v < vendors.size(); ++v)
         {
             Row g; g.kind = Row::Group; g.text = vendors[static_cast<size_t> (v)];
