@@ -13,7 +13,7 @@
 ; 输出：installer\Output\微音桥·MicroBridge v{#MyAppVersion}.exe（发布时压缩为同名 .zip）
 
 #define MyAppName      "微音桥·MicroBridge"
-#define MyAppVersion   "0.1.1"
+#define MyAppVersion   "0.1.2"
 #define MyAppPublisher "MicroBridge"
 #define MyAppExeName   "MicroBridge.exe"
 #define MyAppURL       "https://github.com/l930203811/MicroBridge"

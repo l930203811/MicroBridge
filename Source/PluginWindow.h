@@ -30,7 +30,10 @@ public:
         int ew = 380, eh = 180;
         if (auto* ed = p->createEditorIfNeeded())
         {
-            setContentNonOwned (ed, true);
+            // 必须由窗口「拥有」editor：用 setContentNonOwned 时 editor 永不析构，
+            // VST3 的 IPlugView 不会被 release，导致关闭后再打开时 createEditor()
+            // 返回 nullptr（占位符「插件界面创建失败」）。这是 JUCE 官方宿主做法。
+            setContentOwned (ed, true);
             setResizable (ed->isResizable(), false);
             ew = juce::jmax (320, ed->getWidth());
             eh = juce::jmax (220, ed->getHeight());
@@ -52,6 +55,11 @@ public:
 
     ~PluginWindow() override
     {
+        // 顺序不可颠倒：必须先让 processor 忘记 activeEditor（否则下一次
+        // createEditorIfNeeded() 见 activeEditor 非空直接返回 nullptr），再由
+        // clearContentComponent() 删除 owned editor（JUCE 的 ~AudioProcessorEditor
+        // 亦断言 activeEditor 已被清空）。setContentOwned 保证 editor 真正被 delete，
+        // VST3 的 IPlugView 随之释放，避免旧版 setContentNonOwned 的 editor 泄漏。
         if (auto* ed = dynamic_cast<juce::AudioProcessorEditor*> (getContentComponent()))
             owner_->editorBeingDeleted (ed);
         clearContentComponent();
@@ -61,11 +69,11 @@ public:
 
     void closeButtonPressed() override
     {
-        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<PluginWindow> (this)]
-        {
-            if (safe != nullptr && safe->onClose != nullptr)
-                safe->onClose();
-        });
+        // 关闭 = 隐藏而非销毁：保留 editor 与 VST3 的 IPlugView，
+        // 再次打开时由 openPluginEditor 复用本窗口，根本不触发二次 createEditor，
+        // 从根上规避「关闭后再打开 = 插件界面创建失败」。
+        // 真正的销毁发生在插件被移除/卸载时（MainComponent::closePluginEditor）。
+        setVisible (false);
     }
 
 private:

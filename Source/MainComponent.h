@@ -4475,6 +4475,7 @@ private:
         for (auto* w : pluginWindows_)
             if (w->isFor (p))
             {
+                w->setVisible (true);        // 关闭只隐藏：再次打开需重新显示
                 w->toFront (true);
                 return;
             }
